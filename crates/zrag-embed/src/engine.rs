@@ -230,9 +230,10 @@ fn warmup_model(
 }
 
 pub struct EmbedEngine {
-    /// Hands jobs to the single thread that owns the model/device/scratch. The
-    /// reactor never blocks on GPU work or tokenization — the worker thread
-    /// does both.
+    /// Hands jobs to the tokenizer thread of the embed pipeline (a CPU thread
+    /// that runs `encode_batch` and forwards encoded batches to the GPU thread
+    /// over an internal channel). The reactor never blocks on tokenization or
+    /// GPU work.
     tx: mpsc::UnboundedSender<EmbedRequest>,
     /// Clone source for [`Self::device`]. The model lives on the worker; this
     /// is a cheap, uncontended handle used only to build the GPU rerank scorer
@@ -450,8 +451,34 @@ impl EmbedEngine {
             device,
             scratch,
         };
+
+        // --- Tokenization ↔ GPU pipeline (double-buffer) ---
+        // The indexer submits the next batch before awaiting the current one
+        // (see `indexer.rs`). A single worker still serves those two batches
+        // serially: tokenize N → forward N → tokenize N+1 → forward N+1.
+        // Splitting the worker into a *tokenizer* thread (CPU) and a *GPU*
+        // thread lets the CPU tokenize batch N+1 while the GPU runs the forward
+        // pass for batch N, so the phases overlap. Only the GPU thread ever
+        // touches the model/device, preserving the single-GPU-writer invariant.
+        // Shutdown cascades: engine `tx` drops → `rx` closes → tokenizer loop
+        // ends → `enc_tx` drops → GPU `blocking_recv` returns None.
+        let (enc_tx, mut enc_rx) = mpsc::unbounded_channel::<(EmbedRequest, Vec<Tokenized>)>();
+
+        // GPU thread: owns model/device/scratch, runs the forward pass only.
         std::thread::Builder::new()
-            .name("zrag-embed".into())
+            .name("zrag-embed-gpu".into())
+            .spawn(move || {
+                while let Some((req, encs)) = enc_rx.blocking_recv() {
+                    let enc_refs: Vec<&Tokenized> = encs.iter().collect();
+                    let _ = req.reply.send(embed_on_state(&mut state, &enc_refs, &cfg));
+                }
+            })
+            .map_err(|e| anyhow!("spawn embed gpu worker: {e}"))?;
+
+        // Tokenizer thread: owns the request channel, tokenizes, hands off to
+        // the GPU thread. Encode already parallelizes across rayon internally.
+        std::thread::Builder::new()
+            .name("zrag-embed-tok".into())
             .spawn(move || {
                 while let Some(req) = rx.blocking_recv() {
                     let refs: Vec<&str> = req.texts.iter().map(String::as_str).collect();
@@ -462,11 +489,12 @@ impl EmbedEngine {
                             continue;
                         }
                     };
-                    let enc_refs: Vec<&Tokenized> = encs.iter().collect();
-                    let _ = req.reply.send(embed_on_state(&mut state, &enc_refs, &cfg));
+                    if enc_tx.send((req, encs)).is_err() {
+                        break; // GPU worker gone; nothing more to do.
+                    }
                 }
             })
-            .map_err(|e| anyhow!("spawn embed worker: {e}"))?;
+            .map_err(|e| anyhow!("spawn embed tok worker: {e}"))?;
 
         Ok(Self {
             tx,
