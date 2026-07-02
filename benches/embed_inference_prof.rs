@@ -1,4 +1,7 @@
+mod prof_common;
+
 use anyhow::Result;
+use prof_common::env_or_arg;
 use zrag_embed::EmbedEngine;
 
 const WARMUP: usize = 3;
@@ -16,9 +19,14 @@ const TEXTS: &[&str] = &[
 ];
 
 fn main() -> Result<()> {
-    let model_id = std::env::var("MODEL_ID")
-        .or_else(|_| std::env::args().nth(1).ok_or(std::env::VarError::NotPresent))
-        .expect("set MODEL_ID env var or pass model_id as first arg");
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = prof_common::start_heap_profiler();
+
+    let model_id = env_or_arg(
+        "MODEL_ID",
+        1,
+        "set MODEL_ID env var or pass model_id as first arg",
+    )?;
 
     eprintln!("loading model: {model_id}");
     let engine = EmbedEngine::load(&model_id)?;

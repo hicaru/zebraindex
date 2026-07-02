@@ -13,6 +13,7 @@ path = "src/main.rs"
 default = []
 cuda  = ["zrag-embed/cuda", "zrag-hw/cuda"]
 metal = ["zrag-embed/metal", "zrag-hw/metal"]
+tokio-console = ["dep:console-subscriber", "tokio/tracing"]
 
 [dependencies]
 mimalloc.workspace = true
@@ -35,6 +36,7 @@ anyhow.workspace           = true
 clap.workspace             = true
 tracing.workspace          = true
 tracing-subscriber.workspace = true
+console-subscriber = { workspace = true, optional = true }
 log.workspace              = true
 serde.workspace            = true
 serde_json.workspace       = true

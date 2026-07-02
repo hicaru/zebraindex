@@ -1,11 +1,2 @@
 /target
-Cargo.lock
-.pi
-.rpiv/
-.claude/
-meta-prompt.md
-
-# Site
-site/node_modules/
-site/dist/
-site/.astro/
+/dhat-heap.json

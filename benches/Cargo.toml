@@ -26,6 +26,20 @@ name = "index_prof"
 path = "index_prof.rs"
 harness = false
 
+[[bin]]
+name = "embed_inference_prof"
+path = "embed_inference_prof.rs"
+
+[[bin]]
+name = "index_prof"
+path = "index_prof.rs"
+
+[features]
+default = []
+metal = ["zrag-embed/metal"]
+cuda = ["zrag-embed/cuda"]
+dhat-heap = ["dep:dhat"]
+
 [dependencies]
 zrag-rerank.workspace = true
 zrag-embed.workspace = true
@@ -36,6 +50,7 @@ zrag-pipeline.workspace = true
 zrag-store.workspace = true
 zrag-common.workspace = true
 zrag-protocol.workspace = true
+dhat = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true

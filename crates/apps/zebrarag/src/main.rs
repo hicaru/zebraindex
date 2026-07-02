@@ -3,6 +3,8 @@ use std::borrow::Cow;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
+#[cfg(feature = "tokio-console")]
+use tracing_subscriber::prelude::*;
 
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -58,19 +60,42 @@ enum TopCommand {
     Cli(cli::CliCommand),
 }
 
+fn env_filter(default_level: &str) -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level))
+}
+
+fn cap_log_bridge() {
+    // Installing a tracing subscriber also installs the global LogTracer with
+    // no max-level cap, so every dependency `log!` is bridged + filtered at
+    // runtime. Cap it so warn+ records from dependencies are dropped before
+    // reaching the tracing dispatcher.
+    log::set_max_level(log::LevelFilter::Warn);
+}
+
 fn init_tracing(default_level: &str) {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level)),
-        )
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(env_filter(default_level))
         .with_writer(std::io::stderr)
         .with_ansi(false)
-        .init();
-    // `.init()` installs the global LogTracer with no max-level cap, so
-    // every dependency `log!` is bridged + filtered at runtime. Cap it so
-    // warn+ records from dependencies are dropped before reaching the
-    // tracing dispatcher.
-    log::set_max_level(log::LevelFilter::Warn);
+        .try_init();
+    cap_log_bridge();
+}
+
+#[cfg(feature = "tokio-console")]
+fn init_tokio_console_tracing(default_level: &str) {
+    let console_default = format!("{default_level},tokio=trace,runtime=trace");
+    let console_layer = console_subscriber::ConsoleLayer::builder().spawn();
+
+    let _ = tracing_subscriber::registry()
+        .with(env_filter(&console_default))
+        .with(console_layer)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(false),
+        )
+        .try_init();
+    cap_log_bridge();
 }
 
 fn main() -> Result<()> {
@@ -97,6 +122,9 @@ fn main() -> Result<()> {
             passage_prefix,
             model_dtype,
         }) => {
+            #[cfg(feature = "tokio-console")]
+            init_tokio_console_tracing(zrag_daemon::DAEMON_DEFAULT_LOG_FILTER);
+
             // Resolve the key from the provider env var first, then the OS
             // keyring (where the TUI persists it once at setup) so launching the
             // daemon directly works without re-supplying the key.

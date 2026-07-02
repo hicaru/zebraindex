@@ -17,6 +17,12 @@ pub mod watch;
 
 use state::DaemonState;
 
+pub const DAEMON_DEFAULT_LOG_FILTER: &str = concat!(
+    "info,zrag_daemon=debug,zrag_embed=debug,",
+    "zrag_pipeline=debug,zrag_dsl=debug,zrag_store=debug,",
+    "zrag_rerank=trace",
+);
+
 pub struct DaemonConfig<'a> {
     pub model: Cow<'a, str>,
     pub query_prefix: Option<&'a str>,
@@ -57,16 +63,13 @@ pub fn run_daemon(config: &DaemonConfig<'_>) -> Result<()> {
     write!(pid_file, "{}", std::process::id())?;
     pid_file.flush()?;
 
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new(
-                "info,zrag_daemon=debug,zrag_embed=debug,\
-                 zrag_pipeline=debug,zrag_dsl=debug,zrag_store=debug,\
-                 zrag_rerank=trace",
-            )
-        }))
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(DAEMON_DEFAULT_LOG_FILTER)),
+        )
         .with_writer(std::io::stderr)
-        .init();
+        .try_init();
     // Cap the `log` bridge: dependency debug/trace records are dropped
     // before they reach the tracing dispatcher (matching the main.rs policy).
     log::set_max_level(log::LevelFilter::Warn);

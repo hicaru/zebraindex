@@ -1,8 +1,11 @@
+mod prof_common;
+
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use anyhow::Result;
+use prof_common::env_or_arg;
 use zrag_common::ids::project_id;
 use zrag_embed::{AnyEmbedEngine, EmbedEngine};
 use zrag_pipeline::indexer::index_project;
@@ -12,13 +15,20 @@ use zrag_store::Db;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    let model_id = std::env::var("MODEL_ID")
-        .or_else(|_| std::env::args().nth(1).ok_or(std::env::VarError::NotPresent))
-        .expect("set MODEL_ID env var");
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = prof_common::start_heap_profiler();
 
-    let project_root = std::env::var("PROJECT_ROOT")
-        .or_else(|_| std::env::args().nth(2).ok_or(std::env::VarError::NotPresent))
-        .expect("set PROJECT_ROOT env var");
+    let model_id = env_or_arg(
+        "MODEL_ID",
+        1,
+        "set MODEL_ID env var or pass model_id as first arg",
+    )?;
+
+    let project_root = env_or_arg(
+        "PROJECT_ROOT",
+        2,
+        "set PROJECT_ROOT env var or pass project root as second arg",
+    )?;
 
     let root = Path::new(&project_root).canonicalize()?;
     eprintln!("model:   {model_id}");
