@@ -5,7 +5,7 @@
 //! the code embedding model uses different tensor names and adds Q/K layer
 //! normalization around self-attention.
 
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::HashMap};
 
 use candle_core::{D, DType, Device, Result, Tensor};
 use candle_nn::{
@@ -203,25 +203,64 @@ impl JinaLayer {
     }
 }
 
-#[derive(Debug, Default)]
+/// Sequence lengths above this are rebuilt per call instead of cached:
+/// bias is `n_heads × seq × seq`, so large buckets can hold hundreds of
+/// MiB or more on device. The hot bucketed embed path up to 1024 stays cached;
+/// oversized requests keep today's build-per-call behavior.
+const MAX_CACHED_SEQ: usize = 1024;
+
+#[derive(Debug)]
 struct AlibiCache {
-    value: RefCell<Option<(usize, DType, Tensor)>>,
+    entries: RefCell<HashMap<(usize, DType), Tensor>>,
+    /// Last bias above MAX_CACHED_SEQ. Single slot = the pre-map behavior:
+    /// constant oversized seqs hit; only alternating oversized seqs rebuild.
+    oversized: RefCell<Option<((usize, DType), Tensor)>>,
+}
+
+impl Default for AlibiCache {
+    fn default() -> Self {
+        Self {
+            entries: RefCell::new(HashMap::with_capacity(crate::batch::SEQ_BUCKETS.len() + 1)),
+            oversized: RefCell::new(None),
+        }
+    }
 }
 
 impl AlibiCache {
     fn get(&self, n_heads: usize, seq_len: usize, dtype: DType, device: &Device) -> Result<Tensor> {
-        // Keep the immutable borrow confined to this `if` expression; the miss
-        // path below must be able to take `borrow_mut()` without a live borrow.
-        if let Some((cached_seq, cached_dtype, cached_bias)) = self.value.borrow().as_ref()
-            && *cached_seq == seq_len
-            && *cached_dtype == dtype
+        // `n_heads` and `device` are fixed for the lifetime of the owning model,
+        // so the cache key only needs the bucketed sequence length and dtype.
+        let key = (seq_len, dtype);
+
+        if seq_len <= MAX_CACHED_SEQ {
+            if let Some(bias) = self.entries.borrow().get(&key) {
+                return Ok(bias.clone());
+            }
+
+            let bias = alibi_bias(n_heads, seq_len, device)?.to_dtype(dtype)?;
+            self.entries.borrow_mut().insert(key, bias.clone());
+            return Ok(bias);
+        }
+
+        if let Some((cached_key, bias)) = self.oversized.borrow().as_ref()
+            && *cached_key == key
         {
-            return Ok(cached_bias.clone());
+            return Ok(bias.clone());
         }
 
         let bias = alibi_bias(n_heads, seq_len, device)?.to_dtype(dtype)?;
-        *self.value.borrow_mut() = Some((seq_len, dtype, bias.clone()));
+        *self.oversized.borrow_mut() = Some((key, bias.clone()));
         Ok(bias)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.borrow().len()
+    }
+
+    #[cfg(test)]
+    fn has_oversized(&self) -> bool {
+        self.oversized.borrow().is_some()
     }
 }
 
@@ -337,6 +376,14 @@ mod tests {
             .to_vec1::<f32>()
     }
 
+    fn ensure_same_values(label: &str, expected: &[f32], actual: &Tensor) -> Result<()> {
+        let actual = tensor_values(actual)?;
+        if expected != actual {
+            candle_core::bail!("{label} ALiBi bias differs from fresh bias");
+        }
+        Ok(())
+    }
+
     #[test]
     fn alibi_cache_matches_fresh_bias_for_miss_and_hit() -> Result<()> {
         let device = Device::Cpu;
@@ -347,14 +394,60 @@ mod tests {
             let fresh = alibi_bias(n_heads, seq_len, &device)?.to_dtype(DType::F32)?;
             let fresh_values = tensor_values(&fresh)?;
             let cached = cache.get(n_heads, seq_len, DType::F32, &device)?;
-            if fresh_values != tensor_values(&cached)? {
-                candle_core::bail!("cached ALiBi bias differs from fresh bias for seq {seq_len}");
-            }
+            ensure_same_values("cached", &fresh_values, &cached)?;
 
             let hit = cache.get(n_heads, seq_len, DType::F32, &device)?;
-            if fresh_values != tensor_values(&hit)? {
-                candle_core::bail!("ALiBi cache hit differs from fresh bias for seq {seq_len}");
-            }
+            ensure_same_values("cache hit", &fresh_values, &hit)?;
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn alibi_cache_keeps_alternating_buckets() -> Result<()> {
+        let device = Device::Cpu;
+        let cache = AlibiCache::default();
+        let n_heads = 12;
+
+        cache.get(n_heads, 64, DType::F32, &device)?;
+        cache.get(n_heads, 128, DType::F32, &device)?;
+
+        let fresh = alibi_bias(n_heads, 64, &device)?.to_dtype(DType::F32)?;
+        let fresh_values = tensor_values(&fresh)?;
+        let hit = cache.get(n_heads, 64, DType::F32, &device)?;
+        ensure_same_values("alternating bucket cache hit", &fresh_values, &hit)?;
+
+        if cache.len() != 2 {
+            candle_core::bail!("expected 2 cached ALiBi buckets, got {}", cache.len());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn alibi_cache_uses_single_oversized_slot() -> Result<()> {
+        let device = Device::Cpu;
+        let cache = AlibiCache::default();
+        let n_heads = 1;
+        let seq_len = MAX_CACHED_SEQ + 1;
+
+        let fresh = alibi_bias(n_heads, seq_len, &device)?.to_dtype(DType::F32)?;
+        let fresh_values = tensor_values(&fresh)?;
+        let first = cache.get(n_heads, seq_len, DType::F32, &device)?;
+        ensure_same_values("oversized first", &fresh_values, &first)?;
+
+        if cache.len() != 0 {
+            candle_core::bail!("expected oversized ALiBi bias to stay out of the bounded map");
+        }
+        if !cache.has_oversized() {
+            candle_core::bail!("expected oversized ALiBi bias to use the overflow slot");
+        }
+
+        let second = cache.get(n_heads, seq_len, DType::F32, &device)?;
+        ensure_same_values("oversized cache hit", &fresh_values, &second)?;
+
+        if cache.len() != 0 {
+            candle_core::bail!("expected oversized ALiBi bias to stay out of the bounded map");
         }
 
         Ok(())
