@@ -437,6 +437,31 @@ pub fn is_model_cached(model_id: &str) -> bool {
     })
 }
 
+/// Whether a file in a HuggingFace repo is needed to load and run the local
+/// embedding engine. Everything else — `.bin`/`.onnx` weights, README assets,
+/// `flax/`/`tf/`/`pytorch` export dirs, etc. — is skipped to avoid downloading
+/// the entire repo: a typical embed model ships several GiB of redundant
+/// weight formats alongside the single `*.safetensors` the loader actually
+/// uses.
+fn is_needed_hf_file(rfilename: &str) -> bool {
+    // Weights: any `*.safetensors` (single or sharded) plus the shard index.
+    if rfilename.ends_with(".safetensors") || rfilename.ends_with(".safetensors.index.json") {
+        return true;
+    }
+    // Configs and tokenizer files consumed by `resolve_local` / the loader.
+    // `tokenizer.json` is self-contained (embeds its vocab), so `vocab.txt` /
+    // `special_tokens_map.json` are intentionally not pulled.
+    matches!(
+        rfilename,
+        "config.json"
+            | "tokenizer.json"
+            | "tokenizer_config.json"
+            | "config_sentence_transformers.json"
+            | "onnx/tokenizer.json"
+            | "1_Pooling/config.json"
+    )
+}
+
 fn resolve_hf(model_id: &str) -> Result<ResolvedModel> {
     // Validate the "owner/name" shape up front for a clear early error.
     split_model_id(model_id)?;
@@ -457,10 +482,18 @@ fn resolve_hf(model_id: &str) -> Result<ResolvedModel> {
     match repo.info() {
         Ok(info) => {
             tracing::info!(model = model_id, sha = %info.sha, "syncing HF repo");
+            let mut fetched = 0usize;
+            let mut skipped = 0usize;
             for sibling in &info.siblings {
+                if !is_needed_hf_file(&sibling.rfilename) {
+                    skipped += 1;
+                    continue;
+                }
                 repo.get(&sibling.rfilename)
                     .with_context(|| format!("downloading {} for {model_id}", sibling.rfilename))?;
+                fetched += 1;
             }
+            tracing::info!(model = model_id, fetched, skipped, "synced only needed HF files");
         }
         Err(e) => tracing::debug!(error = %e, "HF repo info failed (offline?); using cache"),
     }
