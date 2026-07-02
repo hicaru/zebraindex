@@ -326,7 +326,10 @@ fn alibi_bias(n_heads: usize, seq_len: usize, device: &Device) -> Result<Tensor>
     let Ok(seq_len_i64) = i64::try_from(seq_len) else {
         candle_core::bail!("ALiBi sequence length {seq_len} exceeds i64::MAX");
     };
-    let positions = Tensor::arange(0, seq_len_i64, &Device::Cpu)?.to_dtype(DType::F32)?;
+    // Built on `device` (not hardcoded CPU) so the Metal/GPU path never
+    // round-trips an n_heads×seq×seq bias tensor through the CPU allocator —
+    // that CPU `broadcast_mul` was the single largest allocation hotspot.
+    let positions = Tensor::arange(0, seq_len_i64, device)?.to_dtype(DType::F32)?;
     let distances = positions
         .reshape((1, seq_len))?
         .broadcast_sub(&positions.reshape((seq_len, 1))?)?
@@ -357,11 +360,10 @@ fn alibi_bias(n_heads: usize, seq_len: usize, device: &Device) -> Result<Tensor>
         );
         reordered
     };
-    let slopes = Tensor::new(slopes, &Device::Cpu)?.reshape((1, (), 1, 1))?;
+    let slopes = Tensor::new(slopes, device)?.reshape((1, (), 1, 1))?;
     distances
         .to_dtype(DType::F32)?
-        .broadcast_mul(&slopes)?
-        .to_device(device)
+        .broadcast_mul(&slopes)
 }
 
 #[cfg(test)]

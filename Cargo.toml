@@ -76,7 +76,7 @@ tree-sitter-ocaml      = "0.25"
 candle-core        = { version = "0.10.2", default-features = false }
 candle-nn          = { version = "0.10.2", default-features = false }
 candle-transformers = { version = "0.10.2", default-features = false }
-tokenizers  = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+tokenizers  = { version = "0.23", default-features = false, features = ["onig"] }
 hf-hub      = { version = "0.4", default-features = false, features = ["ureq"] }
 time        = "0.3"
 
