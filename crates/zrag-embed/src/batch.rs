@@ -213,6 +213,7 @@ mod tests {
             intermediate_size: ffn,
             num_attention_heads: heads,
             compute_dtype: None,
+            format: crate::model_registry::WeightsFormat::default(),
         }
     }
 

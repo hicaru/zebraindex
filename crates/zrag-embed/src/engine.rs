@@ -17,8 +17,10 @@ use crate::jina_bert::JinaBertModel;
 
 use crate::batch::{BATCH_BUCKETS, BATCH_CEILING, SEQ_BUCKETS, next_bucket};
 use crate::model_registry::{
-    ComputeDTypeHint, ModelProfile, PoolingStrategyEnum, read_json, resolve_profile,
+    ComputeDTypeHint, ModelProfile, PoolingStrategyEnum, WeightsFormat, read_json, resolve_profile,
 };
+use crate::qlayers::{Vb, dense_varbuilder_from_gguf};
+use candle_transformers::quantized_var_builder as qvb;
 use crate::pooling::{PoolingStrategy, pool_on_device};
 use crate::tokenizer::{Tokenized, Tokenizer};
 use zrag_hw::{Hardware, candle_device, probe};
@@ -171,22 +173,50 @@ fn dtype_from_hint(hint: ComputeDTypeHint, device: &zrag_hw::Device) -> DType {
     }
 }
 
-fn load_model(profile: &ModelProfile, dtype: DType, device: &candle_core::Device) -> Result<Model> {
-    let vb =
-        unsafe { VarBuilder::from_mmaped_safetensors(&[&profile.weights_path], dtype, device)? };
-
-    match read_json::<PositionEmbeddingPeek>(&profile.config_path)?
+/// Build the embedding model from `profile`.
+///
+/// `quant` selects GGUF behaviour for the Jina path (which owns all its layers
+/// and so can run native-quantized):
+///   * `true`  — keep Q4_0…Q8K weights quantized in memory (fused `vec_dot`),
+///   * `false` — dequantize to F32 (the precision fallback after a NaN warmup).
+///
+/// BERT always runs dense: it delegates its encoder to upstream candle's
+/// `BertEncoder` (dense-only), so a GGUF checkpoint is dequantized to F32.
+/// For safetensors `quant` is irrelevant — `dtype` selects the matmul precision.
+fn load_model(
+    profile: &ModelProfile,
+    dtype: DType,
+    device: &candle_core::Device,
+    quant: bool,
+) -> Result<Model> {
+    let is_jina = read_json::<PositionEmbeddingPeek>(&profile.config_path)?
         .position_embedding_type
         .as_deref()
-    {
-        Some("alibi") => {
-            let config: JinaConfig = read_json(&profile.config_path)?;
-            Ok(Model::Jina(JinaBertModel::load(vb, &config)?))
-        }
-        _ => {
-            let config: BertConfig = read_json(&profile.config_path)?;
-            Ok(Model::Bert(BertModel::load(vb, &config)?))
-        }
+        == Some("alibi");
+
+    if is_jina {
+        let vb = match (profile.format, quant) {
+            (WeightsFormat::Safetensors, _) => Vb::Dense(unsafe {
+                VarBuilder::from_mmaped_safetensors(&[&profile.weights_path], dtype, device)?
+            }),
+            (WeightsFormat::Gguf, true) => {
+                Vb::Quant(qvb::VarBuilder::from_gguf(&profile.weights_path, device)?)
+            }
+            (WeightsFormat::Gguf, false) => {
+                Vb::Dense(dense_varbuilder_from_gguf(&profile.weights_path, device)?)
+            }
+        };
+        let config: JinaConfig = read_json(&profile.config_path)?;
+        Ok(Model::Jina(JinaBertModel::load(vb, &config)?))
+    } else {
+        let vb = match profile.format {
+            WeightsFormat::Safetensors => unsafe {
+                VarBuilder::from_mmaped_safetensors(&[&profile.weights_path], dtype, device)?
+            },
+            WeightsFormat::Gguf => dense_varbuilder_from_gguf(&profile.weights_path, device)?,
+        };
+        let config: BertConfig = read_json(&profile.config_path)?;
+        Ok(Model::Bert(BertModel::load(vb, &config)?))
     }
 }
 
@@ -391,7 +421,7 @@ impl EmbedEngine {
         // and probes the embedding dim when the config didn't provide it. A
         // reduced-precision dtype that overflows (e.g. a candle mask bug) falls
         // back to F32 once instead of silently wasting an entire index.
-        let mut model = load_model(&profile, requested_dtype, &device)?;
+        let mut model = load_model(&profile, requested_dtype, &device, true)?;
         let mut final_dtype = requested_dtype;
         if let Err(e) = warmup_model(
             &model,
@@ -407,10 +437,14 @@ impl EmbedEngine {
             tracing::warn!(
                 error = %e,
                 requested_dtype = ?requested_dtype,
-                "model dtype warmup failed; retrying embed load with F32"
+                format = ?profile.format,
+                "model warmup failed; retrying embed load with a dense F32 fallback"
             );
             profile.dim = 0;
-            model = load_model(&profile, DType::F32, &device)?;
+            // `quant = false` dequantizes a GGUF Jina model to dense F32 (the
+            // native-quant fallback) and, for safetensors, simply reloads at F32
+            // (the reduced-precision/BF16 fallback) — one path covers both.
+            model = load_model(&profile, DType::F32, &device, false)?;
             warmup_model(&model, &tokenizer, &device, &mut profile, DType::F32, &hw)?;
             final_dtype = DType::F32;
         }

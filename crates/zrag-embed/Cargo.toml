@@ -37,6 +37,21 @@ metal = [
   "candle-transformers/metal",
   "zrag-hw/metal",
 ]
+# Accelerate.framework (macOS) BLAS backend for candle's CPU matmuls.
+accelerate = [
+  "candle-core/accelerate",
+  "candle-nn/accelerate",
+  "candle-transformers/accelerate",
+]
+# Intel oneMKL BLAS backend for candle's CPU matmuls (mutually exclusive with
+# `accelerate`; pick the one matching the host platform).
+mkl = [
+  "candle-core/mkl",
+  "candle-nn/mkl",
+  "candle-transformers/mkl",
+]
+# cuDNN fused kernels on top of the `cuda` backend (cuBLAS stays as the fallback).
+cudnn = ["cuda", "candle-core/cudnn"]
 clap  = ["dep:clap"]
 
 [dependencies.clap]

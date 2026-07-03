@@ -30,7 +30,12 @@ fn main() -> Result<()> {
 
     eprintln!("loading model: {model_id}");
     let engine = EmbedEngine::load(&model_id)?;
-    eprintln!("loaded. dim={}", engine.dim());
+    eprintln!(
+        "loaded. dim={}, format={:?}, device={:?}",
+        engine.dim(),
+        engine.profile().format,
+        engine.hardware().device,
+    );
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

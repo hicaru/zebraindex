@@ -13,6 +13,13 @@ path = "src/main.rs"
 default = []
 cuda  = ["zrag-embed/cuda", "zrag-hw/cuda"]
 metal = ["zrag-embed/metal", "zrag-hw/metal"]
+# CPU BLAS backends for candle matmuls (pick the one matching the host platform;
+# accelerate = macOS, mkl = Intel). Routed through zrag-embed only — they don't
+# affect device selection, so zrag-hw is not involved.
+accelerate = ["zrag-embed/accelerate"]
+mkl        = ["zrag-embed/mkl"]
+# cuDNN fused kernels on top of the `cuda` backend (implies cuda transitively).
+cudnn      = ["zrag-embed/cudnn"]
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]
 
 [dependencies]

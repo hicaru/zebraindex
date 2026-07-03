@@ -8,9 +8,9 @@
 use std::{cell::RefCell, collections::HashMap};
 
 use candle_core::{D, DType, Device, Result, Tensor};
-use candle_nn::{
-    Activation, Embedding, LayerNorm, Linear, Module, VarBuilder, embedding, layer_norm, linear,
-    linear_no_bias,
+use candle_nn::{Activation, LayerNorm, Module};
+use crate::qlayers::{
+    QEmbedding, QLinear, Vb, embedding, layer_norm, linear, linear_no_bias,
 };
 use candle_transformers::models::jina_bert::Config;
 
@@ -18,13 +18,13 @@ use crate::bert::extended_attention_mask;
 
 #[derive(Debug)]
 struct JinaEmbeddings {
-    word: Embedding,
-    token_type: Embedding,
+    word: QEmbedding,
+    token_type: QEmbedding,
     layer_norm: LayerNorm,
 }
 
 impl JinaEmbeddings {
-    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+    fn load(vb: Vb, cfg: &Config) -> Result<Self> {
         Ok(Self {
             word: embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("word_embeddings"))?,
             token_type: embedding(
@@ -45,9 +45,9 @@ impl JinaEmbeddings {
 
 #[derive(Debug)]
 struct JinaSelfAttention {
-    query: Linear,
-    key: Linear,
-    value: Linear,
+    query: QLinear,
+    key: QLinear,
+    value: QLinear,
     layer_norm_q: LayerNorm,
     layer_norm_k: LayerNorm,
     n_heads: usize,
@@ -55,7 +55,7 @@ struct JinaSelfAttention {
 }
 
 impl JinaSelfAttention {
-    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+    fn load(vb: Vb, cfg: &Config) -> Result<Self> {
         if cfg.num_attention_heads == 0 {
             candle_core::bail!("JinaBERT num_attention_heads must be non-zero");
         }
@@ -108,12 +108,12 @@ impl JinaSelfAttention {
 
 #[derive(Debug)]
 struct JinaSelfOutput {
-    dense: Linear,
+    dense: QLinear,
     layer_norm: LayerNorm,
 }
 
 impl JinaSelfOutput {
-    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+    fn load(vb: Vb, cfg: &Config) -> Result<Self> {
         Ok(Self {
             dense: linear(cfg.hidden_size, cfg.hidden_size, vb.pp("dense"))?,
             layer_norm: layer_norm(cfg.hidden_size, cfg.layer_norm_eps, vb.pp("LayerNorm"))?,
@@ -133,7 +133,7 @@ struct JinaAttention {
 }
 
 impl JinaAttention {
-    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+    fn load(vb: Vb, cfg: &Config) -> Result<Self> {
         Ok(Self {
             self_attention: JinaSelfAttention::load(vb.pp("self"), cfg)?,
             output: JinaSelfOutput::load(vb.pp("output"), cfg)?,
@@ -148,14 +148,14 @@ impl JinaAttention {
 
 #[derive(Debug)]
 struct JinaMlp {
-    up_gated_layer: Linear,
-    down_layer: Linear,
+    up_gated_layer: QLinear,
+    down_layer: QLinear,
     act: Activation,
     intermediate_size: usize,
 }
 
 impl JinaMlp {
-    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+    fn load(vb: Vb, cfg: &Config) -> Result<Self> {
         Ok(Self {
             up_gated_layer: linear_no_bias(
                 cfg.hidden_size,
@@ -186,7 +186,7 @@ struct JinaLayer {
 }
 
 impl JinaLayer {
-    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+    fn load(vb: Vb, cfg: &Config) -> Result<Self> {
         Ok(Self {
             attention: JinaAttention::load(vb.pp("attention"), cfg)?,
             layer_norm_1: layer_norm(cfg.hidden_size, cfg.layer_norm_eps, vb.pp("layer_norm_1"))?,
@@ -273,7 +273,7 @@ pub struct JinaBertModel {
 }
 
 impl JinaBertModel {
-    pub fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+    pub fn load(vb: Vb, cfg: &Config) -> Result<Self> {
         let embeddings = JinaEmbeddings::load(vb.pp("embeddings"), cfg)?;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         (0..cfg.num_hidden_layers).try_for_each(|index| -> Result<()> {

@@ -23,7 +23,11 @@ pub fn candle_device(hw: &Hardware) -> candle_core::Device {
         }),
         #[cfg(feature = "cuda")]
         Device::Cuda => candle_core::Device::new_cuda(0).unwrap_or_else(|e| {
-            tracing::warn!("CUDA init failed: {e}, falling back to CPU");
+            tracing::warn!(
+                "CUDA init failed ({e}); falling back to CPU. candle 0.10.2 ships \
+                 only NVIDIA (CUDA) and Apple (Metal) GPU backends — AMD/Intel GPUs \
+                 are not supported and run on the CPU (AVX2+FMA) path."
+            );
             candle_core::Device::Cpu
         }),
         _ => candle_core::Device::Cpu,

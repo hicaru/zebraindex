@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+use candle_core::quantized::gguf_file;
 use serde::{Deserialize, Serialize};
 
 use crate::pooling::PoolingStrategy;
@@ -23,6 +24,8 @@ pub struct ModelProfile {
     pub num_attention_heads: usize,
     #[serde(default)]
     pub compute_dtype: Option<ComputeDTypeHint>,
+    #[serde(default)]
+    pub format: WeightsFormat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,11 +61,22 @@ impl From<PoolingStrategyEnum> for PoolingStrategy {
     }
 }
 
+/// On-disk weights container. Drives whether the engine loads a dense
+/// `VarBuilder` (safetensors) or candle's quantized `VarBuilder` (GGUF).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum WeightsFormat {
+    #[default]
+    Safetensors,
+    /// GGUF: quantized weights spanning F32/F16/BF16 and Q4_0…Q8K.
+    Gguf,
+}
+
 pub struct ResolvedModel {
     pub weights_path: PathBuf,
     pub tokenizer_path: PathBuf,
     pub config_path: PathBuf,
     pub tokenizer_config_path: Option<PathBuf>,
+    pub format: WeightsFormat,
 }
 
 #[derive(Debug, Clone)]
@@ -324,6 +338,7 @@ pub fn resolve_profile(
         intermediate_size: cfg.ffn_size(),
         num_attention_heads: cfg.num_attention_heads,
         compute_dtype: cfg.torch_dtype,
+        format: files.format,
     })
 }
 
@@ -336,7 +351,11 @@ pub fn resolve_model_files(model_id: &str) -> Result<ResolvedModel> {
     }
 }
 
-fn find_safetensors_in(dir: &Path) -> Result<PathBuf> {
+/// Collect every weights file with the given extension across the search paths.
+/// Shared by [`find_safetensors_in`] and [`find_gguf_in`] so the directory-scan
+/// logic lives in exactly one place.
+fn weights_with_ext(dir: &Path, ext: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
     for sub in SAFETENSORS_SEARCH {
         let scan = if sub.is_empty() {
             dir.to_path_buf()
@@ -346,19 +365,153 @@ fn find_safetensors_in(dir: &Path) -> Result<PathBuf> {
         if !scan.is_dir() {
             continue;
         }
-        for entry in std::fs::read_dir(&scan)? {
-            let path = entry?.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("safetensors") {
-                continue;
-            }
-            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if name == "model.safetensors" {
-                tracing::info!(path = %path.display(), "selected safetensors weights");
-                return Ok(path);
+        let Ok(entries) = std::fs::read_dir(&scan) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some(ext) {
+                found.push(path);
             }
         }
     }
+    found
+}
+
+fn find_safetensors_in(dir: &Path) -> Result<PathBuf> {
+    for path in weights_with_ext(dir, "safetensors") {
+        if path.file_name().and_then(|s| s.to_str()) == Some("model.safetensors") {
+            tracing::info!(path = %path.display(), "selected safetensors weights");
+            return Ok(path);
+        }
+    }
     anyhow::bail!("no model.safetensors found in {}", dir.display())
+}
+
+/// Locate a single-file GGUF checkpoint (any `*.gguf`).
+fn find_gguf_in(dir: &Path) -> Result<PathBuf> {
+    match weights_with_ext(dir, "gguf").into_iter().next() {
+        Some(path) => {
+            tracing::info!(path = %path.display(), "selected GGUF weights");
+            Ok(path)
+        }
+        None => anyhow::bail!("no *.gguf found in {}", dir.display()),
+    }
+}
+
+fn gguf_meta_u32(
+    md: &std::collections::HashMap<String, gguf_file::Value>,
+    key: &str,
+) -> Option<usize> {
+    md.get(key).and_then(|v| v.to_u32().ok()).map(|n| n as usize)
+}
+
+fn gguf_meta_f64(
+    md: &std::collections::HashMap<String, gguf_file::Value>,
+    key: &str,
+) -> Option<f64> {
+    md.get(key).and_then(|v| v.to_f32().ok()).map(|f| f as f64)
+}
+
+fn gguf_meta_str<'a>(
+    md: &'a std::collections::HashMap<String, gguf_file::Value>,
+    key: &str,
+) -> Option<&'a str> {
+    md.get(key)
+        .and_then(|v| v.to_string().ok())
+        .map(std::string::String::as_str)
+}
+
+/// Derive a `config.json` from a GGUF checkpoint's metadata (BERT-family embedding
+/// models that ship no config — common with llama.cpp conversions) and write it to a
+/// stable temp path, so the rest of the pipeline — which reads `config.json` via the
+/// various `Deserialize` impls — works unchanged.
+///
+/// Keys follow llama.cpp's BERT convention; both the bare and `bert.`-prefixed forms
+/// are accepted. The JSON is shaped to satisfy [`ModelConfig`] and candle's
+/// `BertConfig` / `JinaConfig` / `PositionEmbeddingPeek`.
+fn gguf_metadata_config_path(weights_path: &Path) -> Result<PathBuf> {
+    let mut file = std::fs::File::open(weights_path)
+        .with_context(|| format!("opening GGUF {}", weights_path.display()))?;
+    let content = gguf_file::Content::read(&mut file)?;
+    let md = &content.metadata;
+
+    let hidden_size = ["bert.embedding_length", "embedding_length"]
+        .into_iter()
+        .find_map(|k| gguf_meta_u32(md, k))
+        .ok_or_else(|| anyhow!("GGUF has no bert.embedding_length"))?;
+    let num_hidden_layers = ["bert.block_count", "block_count"]
+        .into_iter()
+        .find_map(|k| gguf_meta_u32(md, k))
+        .ok_or_else(|| anyhow!("GGUF has no bert.block_count"))?;
+    let num_attention_heads = ["bert.attention.head_count", "attention.head_count"]
+        .into_iter()
+        .find_map(|k| gguf_meta_u32(md, k))
+        .ok_or_else(|| anyhow!("GGUF has no bert.attention.head_count"))?;
+    let intermediate_size = ["bert.feed_forward_length", "feed_forward_length"]
+        .into_iter()
+        .find_map(|k| gguf_meta_u32(md, k))
+        .unwrap_or(hidden_size * 4);
+    let max_position_embeddings = [
+        "bert.max_position_embeddings",
+        "max_position_embeddings",
+        "bert.context_length",
+        "context_length",
+    ]
+    .into_iter()
+    .find_map(|k| gguf_meta_u32(md, k))
+    .ok_or_else(|| anyhow!("GGUF has no max_position/context length"))?;
+    let vocab_size = ["bert.vocab_size", "vocab_size"]
+        .into_iter()
+        .find_map(|k| gguf_meta_u32(md, k))
+        .unwrap_or(30522);
+    let type_vocab_size = ["bert.type_vocab_size", "type_vocab_size"]
+        .into_iter()
+        .find_map(|k| gguf_meta_u32(md, k))
+        .unwrap_or(2);
+    let layer_norm_eps = ["bert.layer_norm_eps", "attention.layer_norm_eps", "layer_norm_eps"]
+        .into_iter()
+        .find_map(|k| gguf_meta_f64(md, k))
+        .unwrap_or(1e-12);
+    let position_embedding_type = ["bert.position_embedding_type", "position_embedding_type"]
+        .into_iter()
+        .find_map(|k| gguf_meta_str(md, k))
+        .unwrap_or("absolute");
+
+    let config = serde_json::json!({
+        "vocab_size": vocab_size,
+        "hidden_size": hidden_size,
+        "num_hidden_layers": num_hidden_layers,
+        "num_attention_heads": num_attention_heads,
+        "intermediate_size": intermediate_size,
+        "hidden_act": "gelu",
+        "hidden_dropout_prob": 0.0,
+        "max_position_embeddings": max_position_embeddings,
+        "type_vocab_size": type_vocab_size,
+        "initializer_range": 0.02,
+        "layer_norm_eps": layer_norm_eps,
+        "pad_token_id": 0,
+        "position_embedding_type": position_embedding_type,
+    });
+
+    let stem = weights_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model");
+    let parent = weights_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("dir");
+    let out = std::env::temp_dir()
+        .join(format!("zrag-gguf-config-{parent}-{stem}.json"));
+    std::fs::write(&out, serde_json::to_string_pretty(&config)?)?;
+    tracing::info!(
+        gguf = %weights_path.display(),
+        config = %out.display(),
+        "derived config.json from GGUF metadata (checkpoint shipped none)",
+    );
+    Ok(out)
 }
 
 fn resolve_local(p: &Path) -> Result<ResolvedModel> {
@@ -368,16 +521,27 @@ fn resolve_local(p: &Path) -> Result<ResolvedModel> {
         anyhow::bail!("{} is not a directory", p.display());
     };
 
-    let weights_path = find_safetensors_in(dir)?;
+    // Prefer an explicit GGUF checkpoint (quantized Q4_0…Q8K); fall back to the
+    // dense safetensors file when no `.gguf` is present.
+    let (weights_path, format) = match find_gguf_in(dir) {
+        Ok(path) => (path, WeightsFormat::Gguf),
+        Err(_) => (find_safetensors_in(dir)?, WeightsFormat::Safetensors),
+    };
     let tokenizer_path = find_tokenizer_in(dir)?;
 
-    let config_path = dir.join("config.json");
-    if !config_path.exists() {
+    let candidate = dir.join("config.json");
+    let config_path = if candidate.exists() {
+        candidate
+    } else if format == WeightsFormat::Gguf {
+        // llama.cpp GGUF conversions often ship no config.json; derive one from the
+        // checkpoint's metadata so the rest of the pipeline loads unchanged.
+        gguf_metadata_config_path(&weights_path)?
+    } else {
         anyhow::bail!(
             "missing config.json in {} (the HF clone step should have placed it there)",
             dir.display()
         );
-    }
+    };
 
     let tok_cfg = dir.join("tokenizer_config.json");
     let tokenizer_config_path = if tok_cfg.exists() {
@@ -398,6 +562,7 @@ fn resolve_local(p: &Path) -> Result<ResolvedModel> {
         tokenizer_path,
         config_path,
         tokenizer_config_path,
+        format,
     })
 }
 
@@ -430,11 +595,41 @@ fn split_model_id(model_id: &str) -> Result<(&str, &str)> {
 /// can be loaded without a network download.
 pub fn is_model_cached(model_id: &str) -> bool {
     zrag_common::paths::models_dir().is_ok_and(|cache_dir| {
-        hf_hub::Cache::new(cache_dir)
+        let cached = hf_hub::Cache::new(cache_dir.clone());
+        // A safetensors model is cached once config.json lands; a config-less GGUF
+        // checkpoint (common with llama.cpp conversions) counts once any *.gguf is
+        // present in its snapshot dir.
+        cached
             .model(model_id.to_string())
             .get("config.json")
             .is_some()
+            || any_gguf_cached(&cache_dir, model_id)
     })
+}
+
+/// True if the HF cache holds any `*.gguf` for `model_id`, per the standard cache
+/// layout `models--{org}--{name}/snapshots/{rev}/*.gguf`.
+fn any_gguf_cached(cache_dir: &Path, model_id: &str) -> bool {
+    let Some((org, name)) = model_id.split_once('/') else {
+        return false;
+    };
+    let snapshots = cache_dir
+        .join(format!("models--{org}--{name}"))
+        .join("snapshots");
+    let Ok(revs) = std::fs::read_dir(snapshots) else {
+        return false;
+    };
+    for rev in revs.flatten() {
+        let Ok(files) = std::fs::read_dir(rev.path()) else {
+            continue;
+        };
+        for f in files.flatten() {
+            if f.path().extension().and_then(|s| s.to_str()) == Some("gguf") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Whether a file in a HuggingFace repo is needed to load and run the local
@@ -444,8 +639,12 @@ pub fn is_model_cached(model_id: &str) -> bool {
 /// weight formats alongside the single `*.safetensors` the loader actually
 /// uses.
 fn is_needed_hf_file(rfilename: &str) -> bool {
-    // Weights: any `*.safetensors` (single or sharded) plus the shard index.
-    if rfilename.ends_with(".safetensors") || rfilename.ends_with(".safetensors.index.json") {
+    // Weights: any `*.safetensors` (single or sharded) plus the shard index, and
+    // single-file GGUF checkpoints (quantized Q4_0…Q8K).
+    if rfilename.ends_with(".safetensors")
+        || rfilename.ends_with(".safetensors.index.json")
+        || rfilename.ends_with(".gguf")
+    {
         return true;
     }
     // Configs and tokenizer files consumed by `resolve_local` / the loader.
@@ -510,4 +709,58 @@ fn resolve_hf(model_id: &str) -> Result<ResolvedModel> {
         .ok_or_else(|| anyhow::anyhow!("no parent dir for {}", config_path.display()))?;
 
     resolve_local(snapshot_dir)
+}
+
+#[cfg(test)]
+mod gguf_config_tests {
+    use super::*;
+    use candle_core::quantized::gguf_file::{self, Value};
+    use candle_core::quantized::{GgmlDType, QTensor};
+    use candle_core::{DType, Device};
+
+    #[test]
+    fn derives_config_from_gguf_metadata() -> Result<()> {
+        let dev = Device::Cpu;
+        let w = candle_core::Tensor::arange(0u32, 64, &dev)?
+            .to_dtype(DType::F32)?
+            .reshape((8, 8))?;
+        let qt = QTensor::quantize(&w, GgmlDType::F32)?;
+
+        let vals = [
+            Value::U32(768),
+            Value::U32(12),
+            Value::U32(12),
+            Value::U32(3072),
+            Value::U32(512),
+            Value::U32(30522),
+            Value::F32(1e-12_f32),
+        ];
+        let metadata: [(&str, &Value); 7] = [
+            ("bert.embedding_length", &vals[0]),
+            ("bert.block_count", &vals[1]),
+            ("bert.attention.head_count", &vals[2]),
+            ("bert.feed_forward_length", &vals[3]),
+            ("bert.max_position_embeddings", &vals[4]),
+            ("bert.vocab_size", &vals[5]),
+            ("bert.layer_norm_eps", &vals[6]),
+        ];
+
+        let gguf = std::env::temp_dir().join("zrag-registry-cfg-test.gguf");
+        {
+            let mut f = std::fs::File::create(&gguf)?;
+            gguf_file::write(&mut f, &metadata, &[("t.weight", &qt)])?;
+        }
+
+        let cfg_path = gguf_metadata_config_path(&gguf)?;
+        let cfg: ModelConfig = read_json(&cfg_path)?;
+        assert_eq!(cfg.hidden_size, 768);
+        assert_eq!(cfg.num_hidden_layers, 12);
+        assert_eq!(cfg.num_attention_heads, 12);
+        assert_eq!(cfg.max_position_embeddings, 512);
+        assert_eq!(cfg.intermediate_size, Some(3072));
+
+        let _ = std::fs::remove_file(&gguf);
+        let _ = std::fs::remove_file(&cfg_path);
+        Ok(())
+    }
 }

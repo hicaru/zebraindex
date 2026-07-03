@@ -3,6 +3,7 @@ pub mod batch;
 mod bert;
 pub mod engine;
 mod jina_bert;
+pub mod qlayers;
 pub mod model_registry;
 pub mod normalize;
 pub mod pooling;

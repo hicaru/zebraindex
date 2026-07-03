@@ -1,2 +1,19 @@
+# Non-x86_64 targets (aarch64 / Apple Silicon, etc.): tune to the exact host
+# CPU. On x86_64 this is OVERRIDDEN by the per-target `+avx2,+fma` sections
+# below, so release binaries stay portable to all AVX2 hardware. For a one-off
+# max-perf x86_64 build, pass RUSTFLAGS="-C target-cpu=native" to bypass the pin.
 [build]
 rustflags = ["-C", "target-cpu=native"]
+
+# Portable x86_64 release flags: enable candle's AVX2 quantized kernels
+# (Q4_0…Q8K) without baking in newer extensions (keeps binaries runnable on all
+# AVX2 hardware). Override locally with: RUSTFLAGS="-C target-cpu=native"
+# aarch64 needs nothing — NEON is part of the ABI and enabled by default.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+avx2,+fma"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+avx2,+fma"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-feature=+avx2,+fma"]
