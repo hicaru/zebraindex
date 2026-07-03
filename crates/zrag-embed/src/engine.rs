@@ -19,7 +19,7 @@ use crate::batch::{BATCH_BUCKETS, BATCH_CEILING, SEQ_BUCKETS, next_bucket};
 use crate::model_registry::{
     ComputeDTypeHint, ModelProfile, PoolingStrategyEnum, WeightsFormat, read_json, resolve_profile,
 };
-use crate::qlayers::{Vb, dense_varbuilder_from_gguf};
+use crate::qlayers::{Vb, dense_varbuilder_from_gguf, warn_on_slow_gguf_dtypes};
 use candle_transformers::quantized_var_builder as qvb;
 use crate::pooling::{PoolingStrategy, pool_on_device};
 use crate::tokenizer::{Tokenized, Tokenizer};
@@ -200,6 +200,7 @@ fn load_model(
                 VarBuilder::from_mmaped_safetensors(&[&profile.weights_path], dtype, device)?
             }),
             (WeightsFormat::Gguf, true) => {
+                warn_on_slow_gguf_dtypes(&profile.weights_path, device);
                 Vb::Quant(qvb::VarBuilder::from_gguf(&profile.weights_path, device)?)
             }
             (WeightsFormat::Gguf, false) => {
@@ -213,7 +214,15 @@ fn load_model(
             WeightsFormat::Safetensors => unsafe {
                 VarBuilder::from_mmaped_safetensors(&[&profile.weights_path], dtype, device)?
             },
-            WeightsFormat::Gguf => dense_varbuilder_from_gguf(&profile.weights_path, device)?,
+            WeightsFormat::Gguf => {
+                // Upstream BertEncoder is dense-only, so a GGUF checkpoint is
+                // dequantized to F32: no fused quant kernels / RAM savings here.
+                tracing::warn!(
+                    "GGUF BERT dequantized to F32 (upstream BertEncoder is dense-only); \
+                     no fused quant kernels or RAM savings for this architecture"
+                );
+                dense_varbuilder_from_gguf(&profile.weights_path, device)?
+            }
         };
         let config: BertConfig = read_json(&profile.config_path)?;
         Ok(Model::Bert(BertModel::load(vb, &config)?))

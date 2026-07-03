@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use candle_core::quantized::gguf_file;
+use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Module, Result, Tensor};
 use candle_nn as nn;
 use candle_transformers::quantized_nn as qnn;
@@ -146,4 +147,39 @@ pub fn dense_varbuilder_from_gguf<P: AsRef<Path>>(
         "dequantized GGUF -> dense VarBuilder (F32) for an upstream/dense model",
     );
     Ok(nn::VarBuilder::from_tensors(tensors, DType::F32, device))
+}
+
+/// Warn at load time about GGUF weight dtypes with no fused matmul kernels in
+/// candle 0.10.2. Q8_1 has no SIMD *or* CUDA `vec_dot` (scalar-only on every
+/// backend), and Q8K lacks a fused CUDA kernel (dequant + cuBLAS fallback). Both
+/// still compute correctly — just slowly — so surface them instead of running
+/// silently slow. Other dtypes are logged at info level.
+pub fn warn_on_slow_gguf_dtypes(path: &Path, device: &candle_core::Device) {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return;
+    };
+    let Ok(content) = gguf_file::Content::read(&mut file) else {
+        return;
+    };
+    let mut counts: HashMap<GgmlDType, usize> = HashMap::new();
+    for info in content.tensor_infos.values() {
+        *counts.entry(info.ggml_dtype).or_default() += 1;
+    }
+    let on_cuda = matches!(device, candle_core::Device::Cuda(_));
+    match counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(dtype, _)| dtype)
+    {
+        Some(GgmlDType::Q8_1) => tracing::warn!(
+            "GGUF weights are Q8_1, which has no fused SIMD/CUDA matmul kernels in \
+             candle 0.10.2 (scalar-only); expect slow inference — prefer Q8_0."
+        ),
+        Some(GgmlDType::Q8K) if on_cuda => tracing::warn!(
+            "GGUF weights are Q8K, which has no fused CUDA matmul kernel in candle \
+             0.10.2; CUDA falls back to dequant + cuBLAS — prefer Q6K on GPU."
+        ),
+        Some(dtype) => tracing::info!(?dtype, "GGUF dominant weight dtype"),
+        None => {}
+    }
 }
