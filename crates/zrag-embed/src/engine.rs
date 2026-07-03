@@ -255,7 +255,13 @@ fn dtype_bytes(dtype: DType) -> usize {
     }
 }
 
-fn run_dummy_forward(model: &Model, device: &candle_core::Device, batch: usize, seq: usize) {
+fn run_dummy_forward(
+    model: &Model,
+    device: &candle_core::Device,
+    batch: usize,
+    seq: usize,
+    strategy: &PoolingStrategy,
+) {
     let shape = (batch, seq);
     let Ok(ids) = Tensor::zeros(shape, DType::U32, device) else {
         return;
@@ -266,9 +272,9 @@ fn run_dummy_forward(model: &Model, device: &candle_core::Device, batch: usize, 
     let Ok(mask) = Tensor::ones(shape, DType::U32, device) else {
         return;
     };
-    let _ = model
-        .forward(&ids, &zeros, Some(&mask))
-        .and_then(|out| out.to_device(&candle_core::Device::Cpu));
+    if let Ok(out) = model.forward(&ids, &zeros, Some(&mask)) {
+        let _ = pool_on_device(&out, &mask, strategy, batch);
+    }
 }
 
 fn time_passes(
@@ -277,11 +283,12 @@ fn time_passes(
     batch: usize,
     seq: usize,
     n: usize,
+    strategy: &PoolingStrategy,
 ) -> f64 {
     let mut total = std::time::Duration::ZERO;
     for _ in 0..n {
         let t0 = std::time::Instant::now();
-        run_dummy_forward(model, device, batch, seq);
+        run_dummy_forward(model, device, batch, seq, strategy);
         total += t0.elapsed();
     }
     total.as_secs_f64() / n.max(1) as f64
@@ -304,6 +311,7 @@ fn calibrate_and_prewarm(
     candidate: usize,
     seq_len: usize,
     hw_device: &zrag_hw::Device,
+    strategy: &PoolingStrategy,
 ) -> usize {
     let optimal = if candidate > 1 {
         match hw_device {
@@ -314,8 +322,8 @@ fn calibrate_and_prewarm(
                     .copied()
                     .find(|&b| b <= candidate / 2)
                     .unwrap_or(1);
-                let t_full = time_passes(model, device, candidate, seq_len, 2);
-                let t_half = time_passes(model, device, half, seq_len, 2);
+                let t_full = time_passes(model, device, candidate, seq_len, 2, strategy);
+                let t_half = time_passes(model, device, half, seq_len, 2, strategy);
                 let tp_full = candidate as f64 / t_full.max(f64::MIN_POSITIVE);
                 let tp_half = half as f64 / t_half.max(f64::MIN_POSITIVE);
                 if tp_full >= tp_half * 1.05 { candidate } else { half }
@@ -331,7 +339,7 @@ fn calibrate_and_prewarm(
         .iter()
         .filter(|&&s| s <= seq_len)
     {
-        run_dummy_forward(model, device, optimal, seq);
+        run_dummy_forward(model, device, optimal, seq, strategy);
     }
     optimal
 }
@@ -428,7 +436,15 @@ impl EmbedEngine {
             &hw,
             dtype_bytes(final_dtype),
         );
-        let optimal_batch = calibrate_and_prewarm(&model, &device, candidate, profile.max_length, &hw.device);
+        let pooling = PoolingStrategy::from(profile.pooling);
+        let optimal_batch = calibrate_and_prewarm(
+            &model,
+            &device,
+            candidate,
+            profile.max_length,
+            &hw.device,
+            &pooling,
+        );
         tracing::info!(candidate_batch = candidate, optimal_batch, device = ?hw.device, "calibrated embed batch size");
 
         let scratch = Scratch::with_capacity(BATCH_CEILING, profile.max_length, profile.dim);
@@ -482,7 +498,7 @@ impl EmbedEngine {
             .spawn(move || {
                 while let Some(req) = rx.blocking_recv() {
                     let refs: Vec<&str> = req.texts.iter().map(String::as_str).collect();
-                    let encs = match worker_tokenizer.encode_batch(&refs) {
+                    let encs = match worker_tokenizer.encode_batch(refs) {
                         Ok(e) => e,
                         Err(e) => {
                             let _ = req.reply.send(Err(e));
@@ -531,7 +547,7 @@ impl EmbedEngine {
     }
 
     pub fn tokenize(&self, texts: &[&str]) -> Result<Vec<Tokenized>> {
-        self.tokenizer.encode_batch(texts)
+        self.tokenizer.encode_batch(texts.to_vec())
     }
 
     /// Count tokens in a single text without retaining ids/mask buffers.

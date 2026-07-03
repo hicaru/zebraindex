@@ -305,6 +305,18 @@ pub async fn index_project(
     );
 
     let phase_start = std::time::Instant::now();
+    // TODO(perf): replace eager all_pending Vec with bounded streaming.
+    //
+    // Plan: use crossbeam_channel::bounded(2 * batch_size) to stream chunks
+    // from a producer thread (rayon par_iter flat_map → tx.send) to the
+    // consumer loop.  The consumer collects chunks into a local Vec and builds
+    // remaining / chunk_sym_set / appendix_map after the producer drains.
+    //
+    // Deeper refactor (larger win): compute appendix BFS lazily per-sym_id
+    // instead of precomputing for all sym_ids, then the embed loop can start
+    // as soon as the first batch of chunks arrives — no need to materialize
+    // every chunk before embedding.  Requires: cache appendix results in a
+    // FxHashMap that fills on first access per sym_id.
     let all_pending: Vec<(Chunk<'_>, &'static str, u32)> = tokio::task::block_in_place(|| {
         need_reindex
             .par_iter()
@@ -539,6 +551,13 @@ pub async fn index_project(
     // chunk_ids can't collide with surviving rows — append is duplicate-free.
     // 256 keeps pending_batches bounded at ~1 MB (vs 4096 which never flushed
     // mid-loop for projects under 4096 chunks, causing a single end-of-loop burst).
+    //
+    // Tuning: try 128, 256, 512, 1024 on your fixture and compare
+    //   - DHAT total bytes / peak live
+    //   - Lance ObjectWriter::new total bytes
+    //   - Lance commit count (logged by append_batches)
+    //   - Wall time and embed throughput (chunks/s)
+    // Higher values → fewer commits, larger per-commit write bursts.
     const CHUNK_FLUSH_ROWS: usize = 256;
     let mut pending_batches: Vec<RecordBatch> = Vec::with_capacity(4);
     let mut pending_rows = 0usize;
@@ -663,7 +682,7 @@ pub async fn index_project(
                 "embed loop: turbo encoded",
             );
 
-            let mut chunk_id_builder = FixedSizeBinaryBuilder::new(16);
+            let mut chunk_id_builder = FixedSizeBinaryBuilder::with_capacity(n, 16);
             let mut file_path_builder = StringBuilder::with_capacity(n, n * 64);
             let mut language_builder = StringBuilder::with_capacity(n, n * 8);
             let mut file_type_builder = UInt8Array::builder(n);
@@ -674,11 +693,12 @@ pub async fn index_project(
             let mut total_sub_chunks_builder = UInt32Array::builder(n);
             let mut chunk_strategy_builder = UInt8Array::builder(n);
             let mut parent_sym_id_builder = UInt32Array::builder(n);
-            let mut appendix_sym_ids_builder = ListBuilder::new(UInt32Builder::new());
+            let mut appendix_sym_ids_builder =
+                ListBuilder::with_capacity(UInt32Builder::with_capacity(n * 4), n);
             let mut start_line_builder = UInt32Array::builder(n);
             let mut end_line_builder = UInt32Array::builder(n);
             let mut content_builder = StringBuilder::with_capacity(n, n * 64);
-            let mut turbo_code_builder = BinaryBuilder::new();
+            let mut turbo_code_builder = BinaryBuilder::with_capacity(n, n * 32);
             let mut indexed_at_builder = UInt64Array::builder(n);
 
             for (i, (chunk, lang, fidx)) in batch_items.iter().enumerate() {
@@ -947,7 +967,7 @@ async fn upsert_files(
         .as_nanos() as u64;
 
     let n = rows.len();
-    let mut blake3_builder = FixedSizeBinaryBuilder::new(32);
+    let mut blake3_builder = FixedSizeBinaryBuilder::with_capacity(n, 32);
     let mut paths: Vec<&str> = Vec::with_capacity(n);
     let mut mtimes: Vec<u64> = Vec::with_capacity(n);
     let mut sizes: Vec<u64> = Vec::with_capacity(n);
@@ -1028,7 +1048,7 @@ async fn upsert_project(
         .unwrap_or_default()
         .as_nanos() as u64;
 
-    let mut project_id_builder = FixedSizeBinaryBuilder::new(32);
+    let mut project_id_builder = FixedSizeBinaryBuilder::with_capacity(1, 32);
     project_id_builder.append_value(pid)?;
 
     let lang_values = StringArray::from(languages.iter().map(|l| l.as_str()).collect::<Vec<_>>());

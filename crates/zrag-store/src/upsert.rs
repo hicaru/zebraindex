@@ -31,6 +31,12 @@ pub async fn append_batches(table: &Table, batches: Vec<RecordBatch>) -> Result<
     if batches.is_empty() {
         return Ok(());
     }
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    tracing::info!(
+        batches = batches.len(),
+        rows,
+        "Lance append commit"
+    );
     table.add(batches).execute().await?;
     Ok(())
 }

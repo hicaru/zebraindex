@@ -17,19 +17,27 @@ impl Tokenizer {
             .inner
             .encode(text, false)
             .map_err(|e| anyhow::anyhow!("encode: {}", e))?;
+        // TODO(perf): these .to_vec() calls clone the Encoding's internal
+        // Vec<u32> buffers.  Upstream tokenizers 0.23 exposes only getters
+        // (get_ids / get_attention_mask); there is no take_ids / take_attention_mask.
+        // File a PR on huggingface/tokenizers adding these move-out APIs, then
+        // replace .to_vec() with .take_ids() / .take_attention_mask() here and
+        // in encode_batch below.  Saves 2× batch × seq × 4 bytes per call.
         let ids = encoding.get_ids().to_vec();
         let mask = encoding.get_attention_mask().to_vec();
         Ok(Tokenized { ids, mask })
     }
 
     /// Batch encode. Runs in parallel via rayon inside `tokenizers`.
-    pub fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Tokenized>> {
+    pub fn encode_batch(&self, texts: Vec<&str>) -> Result<Vec<Tokenized>> {
         let encs = self
             .inner
-            .encode_batch(texts.to_vec(), false)
+            .encode_batch(texts, false)
             .map_err(|e| anyhow::anyhow!("encode_batch: {}", e))?;
 
         let mut out = Vec::with_capacity(encs.len());
+        // TODO(perf): same .to_vec() issue as encode() above — waiting on
+        // upstream tokenizers take_ids / take_attention_mask API.
         for enc in encs {
             let ids = enc.get_ids().to_vec();
             let mask = enc.get_attention_mask().to_vec();
