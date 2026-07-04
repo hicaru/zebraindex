@@ -1,3 +1,5 @@
+use crate::probe::CpuCaps;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Device {
     #[default]
@@ -22,4 +24,5 @@ pub struct Hardware {
     pub cpus: usize,
     pub mem_total: u64,
     pub mem_avail: u64,
+    pub cpu: CpuCaps,
 }

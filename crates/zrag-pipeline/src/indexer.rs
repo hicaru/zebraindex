@@ -508,7 +508,7 @@ pub async fn index_project(
     let hw = if let Some(hw) = engine.hardware() {
         hw
     } else {
-        fallback_hw = zrag_hw::probe();
+        fallback_hw = zrag_hw::probe_effective();
         &fallback_hw
     };
     info!(
@@ -859,7 +859,7 @@ pub async fn index_project(
     let hw = if let Some(hw) = engine.hardware() {
         hw
     } else {
-        fallback_hw = zrag_hw::probe();
+        fallback_hw = zrag_hw::probe_effective();
         &fallback_hw
     };
     let previous_row = db.projects_table().await?.get(&pid).await.ok().flatten();

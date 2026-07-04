@@ -8,38 +8,6 @@ use super::super::app::{IndexMethodButton, SetupPhase};
 use super::super::registry::{ModelEntry, ModelSource, RemoteProvider};
 use super::common::{centered_rect, render_bar, render_button_row, spinner_ch};
 
-pub struct DTypeOption {
-    pub label: &'static str,
-    pub cli_value: &'static str,
-    pub description: &'static str,
-    pub detail: &'static str,
-    pub device_tag: &'static str,
-}
-
-pub const DTYPE_CHOICES: &[DTypeOption] = &[
-    DTypeOption {
-        label: "F32",
-        cli_value: "f32",
-        description: "Full precision (32-bit). Highest accuracy.",
-        detail: "Most RAM/VRAM usage. Best for CPU inference.",
-        device_tag: "[CPU]",
-    },
-    DTypeOption {
-        label: "F16",
-        cli_value: "f16",
-        description: "Half precision (16-bit). Fast on GPU.",
-        detail: "Good balance of speed and accuracy.",
-        device_tag: "[GPU]",
-    },
-    DTypeOption {
-        label: "BF16",
-        cli_value: "bf16",
-        description: "Brain float (16-bit). Better range.",
-        detail: "Same size as F16, wider dynamic range.",
-        device_tag: "[GPU]",
-    },
-];
-
 pub fn draw(f: &mut Frame, phase: &SetupPhase, tick: u16) {
     f.render_widget(
         Block::default().style(Style::default().bg(Color::Black)),
@@ -51,8 +19,10 @@ pub fn draw(f: &mut Frame, phase: &SetupPhase, tick: u16) {
         SetupPhase::ModelSelection { entries, selected } => {
             draw_model_selection(f, entries, *selected);
         }
-        SetupPhase::DTypeSelection { model_id, selected } => {
-            draw_dtype_selection(f, model_id, *selected);
+        SetupPhase::DTypeSelection {
+            model_id, choices, selected, hw_label,
+        } => {
+            draw_dtype_selection(f, model_id, choices, *selected, hw_label);
         }
         SetupPhase::DownloadingModel { model_id } => draw_download(f, model_id, tick),
         SetupPhase::IndexMethodSelection {
@@ -193,6 +163,29 @@ fn draw_model_selection(f: &mut Frame, entries: &[ModelEntry], selected: usize) 
             ModelSource::Local => Span::raw(""),
         };
 
+        // Highlight GGUF-capable models; safetensors-only (the default) stays clean.
+        let format_tag = {
+            use zrag_embed::model_registry::WeightsFormat;
+            let quants: Vec<String> = entry
+                .variants
+                .iter()
+                .filter(|v| v.format == WeightsFormat::Gguf)
+                .map(|v| v.precision.to_uppercase())
+                .collect();
+            if quants.is_empty() {
+                if entry.formats.contains(&WeightsFormat::Gguf) {
+                    Span::styled(" [gguf]", Style::default().fg(Color::Magenta))
+                } else {
+                    Span::raw("")
+                }
+            } else {
+                Span::styled(
+                    format!(" [gguf: {}]", quants.join(",")),
+                    Style::default().fg(Color::Magenta),
+                )
+            }
+        };
+
         let line1 = Line::from(vec![
             Span::styled(&entry.model_id, Style::default()),
             Span::styled(
@@ -200,6 +193,7 @@ fn draw_model_selection(f: &mut Frame, entries: &[ModelEntry], selected: usize) 
                 Style::default().fg(Color::DarkGray),
             ),
             tag,
+            format_tag,
         ]);
 
         let line2 = Line::from(vec![
@@ -240,7 +234,13 @@ fn draw_model_selection(f: &mut Frame, entries: &[ModelEntry], selected: usize) 
     f.render_widget(help, layout[1]);
 }
 
-fn draw_dtype_selection(f: &mut Frame, model_id: &str, selected: usize) {
+fn draw_dtype_selection(
+    f: &mut Frame,
+    model_id: &str,
+    choices: &[zrag_embed::precision::DTypeChoice],
+    selected: usize,
+    hw_label: &str,
+) {
     let area = centered_rect(70, 70, f.area());
     f.render_widget(Clear, area);
 
@@ -249,8 +249,8 @@ fn draw_dtype_selection(f: &mut Frame, model_id: &str, selected: usize) {
         .constraints([Constraint::Min(5), Constraint::Length(3)])
         .split(area);
 
-    let mut items: Vec<ListItem> = Vec::with_capacity(DTYPE_CHOICES.len());
-    for (i, opt) in DTYPE_CHOICES.iter().enumerate() {
+    let mut items: Vec<ListItem> = Vec::with_capacity(choices.len());
+    for (i, opt) in choices.iter().enumerate() {
         let is_sel = i == selected;
         let prefix = if is_sel { "> " } else { "  " };
         let style = if is_sel {
@@ -261,25 +261,34 @@ fn draw_dtype_selection(f: &mut Frame, model_id: &str, selected: usize) {
             Style::default()
         };
 
+        let rec = if opt.recommended {
+            Span::styled(" ★ recommended", Style::default().fg(Color::Green))
+        } else {
+            Span::raw("")
+        };
+        let warn_color = if opt.warning.is_some() { Color::Yellow } else { Color::DarkGray };
+
         let line1 = Line::from(vec![
             Span::styled(prefix, style),
-            Span::styled(opt.label, style),
+            Span::styled(opt.label.clone(), style),
+            rec,
             Span::raw("  "),
-            Span::styled(opt.description, Style::default().fg(Color::Gray)),
+            Span::styled(opt.description.clone(), Style::default().fg(Color::Gray)),
             Span::raw("  "),
-            Span::styled(opt.device_tag, Style::default().fg(Color::DarkGray)),
+            Span::styled(opt.device_tag.clone(), Style::default().fg(Color::DarkGray)),
         ]);
 
+        let second = opt.warning.clone().unwrap_or_else(|| opt.detail.clone());
         let line2 = Line::from(vec![
             Span::raw("    "),
-            Span::styled(opt.detail, Style::default().fg(Color::DarkGray)),
+            Span::styled(second, Style::default().fg(warn_color)),
         ]);
 
         items.push(ListItem::new(vec![line1, line2]));
     }
 
     let block = Block::default()
-        .title(format!(" Select Data Type  |  Model: {} ", model_id))
+        .title(format!(" Select Precision  |  {}  |  Hardware: {} ", model_id, hw_label))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 

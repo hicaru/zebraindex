@@ -80,13 +80,13 @@ pub fn run_daemon(config: &DaemonConfig<'_>) -> Result<()> {
     }
 
     tracing::info!("loading model: {}", config.model);
-    let hw = Arc::new(zrag_hw::probe());
+    let hw = Arc::new(zrag_hw::probe_effective());
     tracing::info!(device = ?hw.device, "hardware detected");
 
     let opts = LoadOverrides {
         query_prefix: config.query_prefix,
         passage_prefix: config.passage_prefix,
-        model_dtype: config.model_dtype.and_then(zrag_embed::parse_model_dtype),
+        model_dtype: config.model_dtype,
     };
     let is_remote_model = RemoteProvider::from_model_id(config.model.as_ref()).is_some();
     let preloaded_engine = if is_remote_model {

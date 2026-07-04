@@ -72,6 +72,7 @@ mod tests {
             cpus: 8,
             mem_total: mem,
             mem_avail: mem,
+            cpu: zrag_hw_core::CpuCaps::default(),
         }
     }
 

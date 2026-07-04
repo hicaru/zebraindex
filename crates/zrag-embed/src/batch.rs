@@ -179,7 +179,7 @@ fn prev_power_of_two(n: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zrag_hw::{Device, Hardware};
+    use zrag_hw::{CpuCaps, Device, Hardware};
 
     fn hw(device: Device, mem_avail_gib: u64) -> Hardware {
         Hardware {
@@ -187,6 +187,7 @@ mod tests {
             cpus: 8,
             mem_total: mem_avail_gib << 30,
             mem_avail: mem_avail_gib << 30,
+            cpu: CpuCaps::default(),
         }
     }
 

@@ -6,6 +6,7 @@ mod jina_bert;
 pub mod qlayers;
 pub mod model_registry;
 pub mod normalize;
+pub mod precision;
 pub mod pooling;
 pub mod tokenizer;
 

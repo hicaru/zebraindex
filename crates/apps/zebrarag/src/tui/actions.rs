@@ -54,8 +54,8 @@ pub async fn handle_action(
                 {
                     *selected += 1;
                 }
-                app::Screen::Setup(app::SetupPhase::DTypeSelection { selected, .. })
-                    if *selected + 1 < super::widgets::setup::DTYPE_CHOICES.len() =>
+                app::Screen::Setup(app::SetupPhase::DTypeSelection { choices, selected, .. })
+                    if *selected + 1 < choices.len() =>
                 {
                     *selected += 1;
                 }
@@ -152,14 +152,17 @@ pub async fn handle_action(
                     ModelSource::Local => {
                         let model_id: Arc<str> = Arc::from(entry.model_id.as_str());
                         if entry.is_downloaded() {
-                            let pre_selected = match app.local_hardware.as_ref().map(|h| &h.device)
-                            {
-                                Some(zrag_hw::Device::Cpu) => 0,
-                                _ => 1,
-                            };
+                            let hw = app.local_hardware.clone().unwrap_or_default();
+                            let variants = entry.variants.clone();
+                            let choices: Arc<[zrag_embed::precision::DTypeChoice]> = Arc::from(
+                                zrag_embed::precision::build_dtype_choices(&variants, &hw),
+                            );
+                            let sel = choices.iter().position(|c| c.recommended).unwrap_or(0);
                             app.screen = app::Screen::Setup(app::SetupPhase::DTypeSelection {
                                 model_id,
-                                selected: pre_selected,
+                                choices,
+                                selected: sel,
+                                hw_label: hw.cpu.label(),
                             });
                         } else {
                             let id = Arc::clone(&model_id);
@@ -171,9 +174,9 @@ pub async fn handle_action(
                     }
                 }
             }
-            app::Screen::Setup(app::SetupPhase::DTypeSelection { model_id, selected }) => {
-                let dtype_label = super::widgets::setup::DTYPE_CHOICES[*selected].cli_value;
-                app.model_dtype = Some(Arc::from(dtype_label));
+            app::Screen::Setup(app::SetupPhase::DTypeSelection { model_id, choices, selected, .. }) => {
+                let dtype_label = choices[*selected].cli_value.clone();
+                app.model_dtype = Some(Arc::from(dtype_label.as_str()));
 
                 let default_hw = zrag_hw::Hardware::default();
                 let hw = app.local_hardware.as_ref().unwrap_or(&default_hw);

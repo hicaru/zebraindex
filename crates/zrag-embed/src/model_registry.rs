@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result, anyhow};
-use candle_core::quantized::gguf_file;
+use candle_core::quantized::{GgmlDType, gguf_file};
 use serde::{Deserialize, Serialize};
 
 use crate::pooling::PoolingStrategy;
@@ -44,6 +46,15 @@ impl ComputeDTypeHint {
             _ => None,
         }
     }
+
+    /// Canonical lowercase precision id ("f32" | "f16" | "bf16").
+    pub fn precision_id(&self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F16 => "f16",
+            Self::BF16 => "bf16",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -69,6 +80,27 @@ pub enum WeightsFormat {
     Safetensors,
     /// GGUF: quantized weights spanning F32/F16/BF16 and Q4_0…Q8K.
     Gguf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeightVariant {
+    pub format: WeightsFormat,
+    /// Canonical precision id: "f32" | "f16" | "bf16" | "q4_k_m" | "q8_0" | ...
+    pub precision: String,
+    /// Repo filename for GGUF variants (drives file selection at load time).
+    pub file: Option<String>,
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DTypeChoice {
+    pub label: String,
+    pub cli_value: String,
+    pub description: String,
+    pub detail: String,
+    pub device_tag: String,
+    pub recommended: bool,
+    pub warning: Option<String>,
 }
 
 pub struct ResolvedModel {
@@ -388,9 +420,20 @@ fn find_safetensors_in(dir: &Path) -> Result<PathBuf> {
     anyhow::bail!("no model.safetensors found in {}", dir.display())
 }
 
-/// Locate a single-file GGUF checkpoint (any `*.gguf`).
-fn find_gguf_in(dir: &Path) -> Result<PathBuf> {
-    match weights_with_ext(dir, "gguf").into_iter().next() {
+/// Locate a GGUF checkpoint, preferring a specific quant variant when given.
+pub(crate) fn find_gguf_in(dir: &Path, variant: Option<&str>) -> Result<PathBuf> {
+    let all = weights_with_ext(dir, "gguf");
+    if let Some(v) = variant {
+        if let Some(p) = all.iter().find(|p| {
+            quant_from_filename(&p.file_name().unwrap_or_default().to_string_lossy())
+                .is_some_and(|q| q == v)
+        }) {
+            tracing::info!(path = %p.display(), variant = v, "selected GGUF quant variant");
+            return Ok(p.clone());
+        }
+        tracing::warn!(variant = v, "requested GGUF variant not found; using first available");
+    }
+    match all.into_iter().next() {
         Some(path) => {
             tracing::info!(path = %path.display(), "selected GGUF weights");
             Ok(path)
@@ -523,7 +566,7 @@ fn resolve_local(p: &Path) -> Result<ResolvedModel> {
 
     // Prefer an explicit GGUF checkpoint (quantized Q4_0…Q8K); fall back to the
     // dense safetensors file when no `.gguf` is present.
-    let (weights_path, format) = match find_gguf_in(dir) {
+    let (weights_path, format) = match find_gguf_in(dir, None) {
         Ok(path) => (path, WeightsFormat::Gguf),
         Err(_) => (find_safetensors_in(dir)?, WeightsFormat::Safetensors),
     };
@@ -599,37 +642,236 @@ pub fn is_model_cached(model_id: &str) -> bool {
         // A safetensors model is cached once config.json lands; a config-less GGUF
         // checkpoint (common with llama.cpp conversions) counts once any *.gguf is
         // present in its snapshot dir.
-        cached
+        if cached
             .model(model_id.to_string())
             .get("config.json")
             .is_some()
-            || any_gguf_cached(&cache_dir, model_id)
+        {
+            return true;
+        }
+        // GGUF check: scan snapshot dirs for any *.gguf file.
+        if let Some((org, name)) = model_id.split_once('/') {
+            let snapshots = cache_dir
+                .join(format!("models--{org}--{name}"))
+                .join("snapshots");
+            if let Ok(revs) = std::fs::read_dir(&snapshots) {
+                for rev in revs.flatten() {
+                    if let Ok(files) = std::fs::read_dir(rev.path()) {
+                        for f in files.flatten() {
+                            if f.path()
+                                .extension()
+                                .and_then(|s| s.to_str())
+                                == Some("gguf")
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
     })
 }
 
-/// True if the HF cache holds any `*.gguf` for `model_id`, per the standard cache
-/// layout `models--{org}--{name}/snapshots/{rev}/*.gguf`.
-fn any_gguf_cached(cache_dir: &Path, model_id: &str) -> bool {
+/// True if the HF cache holds any `*.{ext}` for `model_id`, per the standard cache
+/// layout `models--{org}--{name}/snapshots/{rev}/*`.
+
+
+// ── Weight-variant detection (precision-level) ───────────────────────────
+
+/// Detect weight variants (precision-level) for `model_id`: cache-first
+/// (offline-friendly, instant), network-second. Returns one entry per
+/// distinct (format, precision) pair. Never empty — falls back to a
+/// safetensors default so the dtype picker always has at least one row.
+pub fn detect_weight_variants(model_id: &str) -> Vec<WeightVariant> {
+    let mut out = Vec::new();
+    let Ok(cache_dir) = zrag_common::paths::models_dir() else {
+        return out;
+    };
+
+    // 1. Cache FIRST — offline-friendly and instant.
+    collect_cached_variants(&cache_dir, model_id, &mut out);
+
+    // 2. Network only when the cache told us nothing.
+    if out.is_empty() {
+        if let Some(siblings) = hf_repo_siblings(&cache_dir, model_id) {
+            let st_precision = safetensors_precision(&cache_dir, model_id);
+            for name in &siblings {
+                if name.ends_with(".safetensors") {
+                    push_unique(
+                        &mut out,
+                        WeightVariant {
+                            format: WeightsFormat::Safetensors,
+                            precision: st_precision.clone(),
+                            file: None,
+                            size_bytes: None,
+                        },
+                    );
+                } else if name.ends_with(".gguf") {
+                    push_unique(
+                        &mut out,
+                        WeightVariant {
+                            format: WeightsFormat::Gguf,
+                            precision: quant_from_filename(name)
+                                .unwrap_or_else(|| "gguf".into()),
+                            file: Some(name.clone()),
+                            size_bytes: None,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    if out.is_empty() {
+        out.push(WeightVariant {
+            format: WeightsFormat::Safetensors,
+            precision: "f32".into(),
+            file: None,
+            size_bytes: None,
+        });
+    }
+    out
+}
+
+/// List sibling filenames for a HF repo via the sync API; `None` if unreachable.
+fn hf_repo_siblings(cache_dir: &Path, model_id: &str) -> Option<Vec<String>> {
+    let api = hf_hub::api::sync::ApiBuilder::new()
+        .with_cache_dir(cache_dir.to_path_buf())
+        .build()
+        .ok()?;
+    let info = api.model(model_id.to_string()).info().ok()?;
+    Some(info.siblings.into_iter().map(|s| s.rfilename).collect())
+}
+
+/// `"model-Q4_K_M.gguf"` -> `"q4_k_m"`; `"foo.f16.gguf"` -> `"f16"`;
+/// `"model.gguf"` -> `None`.
+pub fn quant_from_filename(name: &str) -> Option<String> {
+    static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)[-_.](q\d(?:_[a-z0-9]+)*|iq\d[_a-z0-9]*|f16|f32|bf16)\.gguf$",
+        )
+        .expect("gguf-quant regex is a compile-time constant")
+    });
+    RE.captures(name).map(|c| c[1].to_ascii_lowercase())
+}
+
+/// Dominant tensor dtype from the GGUF header (header-only read, ~KBs).
+fn gguf_precision_from_header(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let content = gguf_file::Content::read(&mut file).ok()?;
+    let mut counts: HashMap<GgmlDType, usize> = HashMap::new();
+    for info in content.tensor_infos.values() {
+        *counts.entry(info.ggml_dtype).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, n)| *n)
+        .map(|(dt, _)| normalize_ggml_dtype(dt))
+}
+
+/// Map a candle `GgmlDType` to a canonical precision id.
+fn normalize_ggml_dtype(dt: GgmlDType) -> String {
+    match dt {
+        GgmlDType::F32 => "f32",
+        GgmlDType::F16 => "f16",
+        GgmlDType::BF16 => "bf16",
+        GgmlDType::Q4_0 => "q4_0",
+        GgmlDType::Q4_1 => "q4_1",
+        GgmlDType::Q5_0 => "q5_0",
+        GgmlDType::Q5_1 => "q5_1",
+        GgmlDType::Q8_0 => "q8_0",
+        GgmlDType::Q8_1 => "q8_1",
+        GgmlDType::Q2K => "q2_k",
+        GgmlDType::Q3K => "q3_k",
+        GgmlDType::Q4K => "q4_k",
+        GgmlDType::Q5K => "q5_k",
+        GgmlDType::Q6K => "q6_k",
+        GgmlDType::Q8K => "q8_k",
+    }
+    .to_string()
+}
+
+/// Deduplicate by (format, precision) — multiple shards share one entry.
+fn push_unique(out: &mut Vec<WeightVariant>, v: WeightVariant) {
+    if !out.iter().any(|e| e.format == v.format && e.precision == v.precision) {
+        out.push(v);
+    }
+}
+
+/// Scan snapshot dirs for `.gguf`/`.safetensors`, reading GGUF headers for
+/// plain-named files and `config.json` `torch_dtype` for safetensors.
+fn collect_cached_variants(cache_dir: &Path, model_id: &str, out: &mut Vec<WeightVariant>) {
     let Some((org, name)) = model_id.split_once('/') else {
-        return false;
+        return;
     };
     let snapshots = cache_dir
         .join(format!("models--{org}--{name}"))
         .join("snapshots");
-    let Ok(revs) = std::fs::read_dir(snapshots) else {
-        return false;
+    let Ok(revs) = std::fs::read_dir(&snapshots) else {
+        return;
     };
+    let st_precision = cached_safetensors_precision(&snapshots);
     for rev in revs.flatten() {
         let Ok(files) = std::fs::read_dir(rev.path()) else {
             continue;
         };
         for f in files.flatten() {
-            if f.path().extension().and_then(|s| s.to_str()) == Some("gguf") {
-                return true;
+            let fname = f.file_name();
+            let fname = fname.to_string_lossy();
+            if fname.ends_with(".safetensors") {
+                push_unique(
+                    out,
+                    WeightVariant {
+                        format: WeightsFormat::Safetensors,
+                        precision: st_precision.clone(),
+                        file: None,
+                        size_bytes: f.metadata().ok().map(|m| m.len()),
+                    },
+                );
+            } else if fname.ends_with(".gguf") {
+                let precision = quant_from_filename(&fname)
+                    .or_else(|| gguf_precision_from_header(&f.path()))
+                    .unwrap_or_else(|| "gguf".into());
+                push_unique(
+                    out,
+                    WeightVariant {
+                        format: WeightsFormat::Gguf,
+                        precision,
+                        file: Some(fname.into_owned()),
+                        size_bytes: f.metadata().ok().map(|m| m.len()),
+                    },
+                );
             }
         }
     }
-    false
+}
+
+/// Read `torch_dtype` from the first `config.json` in any snapshot revision.
+fn cached_safetensors_precision(snapshots: &Path) -> String {
+    let Ok(revs) = std::fs::read_dir(snapshots) else {
+        return "f32".into();
+    };
+    for rev in revs.flatten() {
+        let cfg = rev.path().join("config.json");
+        if let Ok(text) = std::fs::read_to_string(&cfg) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(dt) = v.get("torch_dtype").and_then(|d| d.as_str()) {
+                    if let Some(hint) = ComputeDTypeHint::from_torch_dtype(dt) {
+                        return hint.precision_id().into();
+                    }
+                }
+            }
+        }
+    }
+    "f32".into()
+}
+
+/// Safetensors precision for a repo (network path): defaults to `"f16"` since
+/// most HF embed models ship f16 and `config.json` is not yet downloaded.
+fn safetensors_precision(_cache_dir: &Path, _model_id: &str) -> String {
+    "f16".into()
 }
 
 /// Whether a file in a HuggingFace repo is needed to load and run the local
@@ -762,5 +1004,37 @@ mod gguf_config_tests {
         let _ = std::fs::remove_file(&gguf);
         let _ = std::fs::remove_file(&cfg_path);
         Ok(())
+    }
+
+    #[test]
+    fn quant_from_filename_parses_quant_suffix() {
+        assert_eq!(
+            quant_from_filename("m-Q4_K_M.gguf"),
+            Some("q4_k_m".into())
+        );
+        assert_eq!(quant_from_filename("m.f16.gguf"), Some("f16".into()));
+        assert_eq!(quant_from_filename("m-BF16.gguf"), Some("bf16".into()));
+        assert_eq!(
+            quant_from_filename("m-IQ2_XXS.gguf"),
+            Some("iq2_xxs".into())
+        );
+        assert_eq!(quant_from_filename("model.gguf"), None);
+        assert_eq!(quant_from_filename("Q8_0.gguf"), None); // no separator prefix
+    }
+
+    #[test]
+    fn normalize_ggml_dtype_covers_all_variants() {
+        assert_eq!(normalize_ggml_dtype(GgmlDType::F32), "f32");
+        assert_eq!(normalize_ggml_dtype(GgmlDType::Q4K), "q4_k");
+        assert_eq!(normalize_ggml_dtype(GgmlDType::Q8_0), "q8_0");
+        assert_eq!(normalize_ggml_dtype(GgmlDType::BF16), "bf16");
+    }
+
+    #[test]
+    fn detect_weight_variants_never_empty() {
+        // Even a bogus model_id returns at least one fallback variant.
+        let variants = detect_weight_variants("nonexistent/model");
+        assert!(!variants.is_empty());
+        assert!(variants.iter().any(|v| v.precision == "f32"));
     }
 }

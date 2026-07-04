@@ -12236,6 +12236,7 @@ dependencies = [
  "candle-transformers",
  "clap",
  "hf-hub",
+ "regex",
  "serde",
  "serde_json",
  "tokenizers 0.23.1",

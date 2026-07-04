@@ -1,4 +1,4 @@
-pub use zrag_hw_core::{Device, Hardware};
+pub use zrag_hw_core::{CpuCaps, Device, Hardware};
 
 pub fn supported_devices() -> Vec<Device> {
     let mut devs = Vec::with_capacity(3);
@@ -32,4 +32,21 @@ pub fn candle_device(hw: &Hardware) -> candle_core::Device {
         }),
         _ => candle_core::Device::Cpu,
     }
+}
+
+/// Like [`probe`] but corrects [`Hardware::device`] when a GPU backend init
+/// fails (e.g. Metal not available on this system). The returned
+/// [`Hardware`] always reflects the *effective* device so the TUI header and
+/// dtype recommendations don't lie about what the engine will actually use.
+pub fn probe_effective() -> Hardware {
+    let mut hw = probe();
+    let dev = candle_device(&hw);
+    if matches!(dev, candle_core::Device::Cpu) && hw.device != Device::Cpu {
+        tracing::warn!(
+            claimed = %hw.device.as_str(),
+            "backend init failed; hardware downgraded to CPU",
+        );
+        hw.device = Device::Cpu;
+    }
+    hw
 }

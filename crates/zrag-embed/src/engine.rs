@@ -74,7 +74,10 @@ pub fn apply_prefix<'a>(text: &'a str, prefix: Option<&str>) -> Cow<'a, str> {
 pub struct LoadOverrides<'a> {
     pub query_prefix: Option<&'a str>,
     pub passage_prefix: Option<&'a str>,
-    pub model_dtype: Option<DType>,
+    /// Raw precision string: "f16", "f32", "bf16", "q4_k_m", etc. Flows
+    /// through IPC untouched and is resolved into a dense DType or GGUF
+    /// quant selector in [`EmbedEngine::load_with`].
+    pub model_dtype: Option<&'a str>,
 }
 
 pub fn parse_model_dtype(raw: &str) -> Option<DType> {
@@ -84,6 +87,25 @@ pub fn parse_model_dtype(raw: &str) -> Option<DType> {
         "f32" | "float32" | "float" => Some(DType::F32),
         _ => None,
     }
+}
+
+/// A user-requested precision: either a dense candle DType or a GGUF quant
+/// selector string (e.g. "q4_k_m") matched against variant filenames.
+pub enum RequestedPrecision {
+    Dense(DType),
+    /// GGUF quant selector, e.g. "q4_k_m" — matched against variant filenames.
+    Quant(String),
+}
+
+/// Parse a raw precision string into either a dense [`DType`] or a GGUF
+/// quant selector. Returns `None` for unrecognized values (caller falls
+/// back to profile/defaults).
+pub fn parse_requested_precision(raw: &str) -> Option<RequestedPrecision> {
+    if let Some(dt) = parse_model_dtype(raw) {
+        return Some(RequestedPrecision::Dense(dt));
+    }
+    let l = raw.to_ascii_lowercase();
+    (l.starts_with('q') || l.starts_with("iq")).then_some(RequestedPrecision::Quant(l))
 }
 
 struct Scratch {
@@ -399,15 +421,37 @@ impl EmbedEngine {
         tracing::info!(path = %profile.weights_path.display(), "loading safetensors model");
 
         let device = candle_device(&hw);
-        let requested_dtype = opts
-            .model_dtype
-            .or_else(|| {
-                profile
-                    .compute_dtype
-                    .filter(|_| !matches!(hw.device, zrag_hw::Device::Cpu))
-                    .map(|hint| dtype_from_hint(hint, &hw.device))
-            })
-            .unwrap_or(DType::F32);
+        let requested = opts.model_dtype.and_then(|raw| {
+            match parse_requested_precision(raw) {
+                Some(p) => Some(p),
+                None => {
+                    tracing::warn!(raw, "unrecognized model dtype; falling back to default");
+                    None
+                }
+            }
+        });
+
+        // Select the GGUF quant variant file when a quant is requested.
+        if let Some(RequestedPrecision::Quant(ref v)) = requested {
+            if profile.format == WeightsFormat::Gguf {
+                if let Some(dir) = profile.weights_path.parent() {
+                    if let Ok(path) = crate::model_registry::find_gguf_in(dir, Some(v)) {
+                        profile.weights_path = path;
+                    }
+                }
+            }
+        }
+
+        // Quant-first unless the user explicitly chose a dense dtype.
+        let quant_first = !matches!(requested, Some(RequestedPrecision::Dense(_)));
+        let requested_dtype: DType = match requested {
+            Some(RequestedPrecision::Dense(dt)) => dt,
+            _ => profile
+                .compute_dtype
+                .filter(|_| !matches!(hw.device, zrag_hw::Device::Cpu))
+                .map(|hint| dtype_from_hint(hint, &hw.device))
+                .unwrap_or(DType::F32),
+        };
         let mut tokenizer = Tokenizer::from_file(&profile.tokenizer_path)?;
 
         let seq_cap = crate::batch::attention_safe_seq_cap(&profile, &hw);
@@ -430,7 +474,7 @@ impl EmbedEngine {
         // and probes the embedding dim when the config didn't provide it. A
         // reduced-precision dtype that overflows (e.g. a candle mask bug) falls
         // back to F32 once instead of silently wasting an entire index.
-        let mut model = load_model(&profile, requested_dtype, &device, true)?;
+        let mut model = load_model(&profile, requested_dtype, &device, quant_first)?;
         let mut final_dtype = requested_dtype;
         if let Err(e) = warmup_model(
             &model,

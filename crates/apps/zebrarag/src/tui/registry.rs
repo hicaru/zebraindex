@@ -18,7 +18,7 @@ pub enum ModelSource {
     Remote(RemoteProvider),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ModelEntry {
     pub model_id: String,
     pub parameters: String,
@@ -26,6 +26,14 @@ pub struct ModelEntry {
     pub description: String,
     #[serde(default, skip_deserializing)]
     pub source: ModelSource,
+    /// Weight formats detected for this model (safetensors / gguf) by searching
+    /// its HF repo + local cache. Populated at load; not read from models.toml.
+    #[serde(default, skip_deserializing)]
+    pub formats: Vec<zrag_embed::model_registry::WeightsFormat>,
+    /// Precision-level variants detected for this model (populated async by
+    /// `detect_weight_variants`, streamed into the list as they resolve).
+    #[serde(default, skip_deserializing)]
+    pub variants: Vec<zrag_embed::model_registry::WeightVariant>,
 }
 
 pub fn is_model_downloaded(model_id: &str) -> bool {
@@ -52,6 +60,8 @@ pub fn remote_sentinel(provider: RemoteProvider) -> ModelEntry {
             provider.label()
         ),
         source: ModelSource::Remote(provider),
+        formats: Vec::new(),
+        variants: Vec::new(),
     }
 }
 

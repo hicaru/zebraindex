@@ -183,10 +183,10 @@ impl DaemonState {
         } else {
             let hw = Arc::clone(&self.hardware);
             let owned = model_id.to_owned();
-            let model_dtype = self.model_dtype.as_deref().and_then(zrag_embed::parse_model_dtype);
+            let model_dtype = self.model_dtype.as_deref().map(String::from);
             tokio::task::spawn_blocking(move || {
                 EmbedEngine::load_with(&owned, hw, &LoadOverrides {
-                    model_dtype,
+                    model_dtype: model_dtype.as_deref(),
                     ..Default::default()
                 })
                 .map(AnyEmbedEngine::Local)

@@ -39,7 +39,7 @@ pub fn run_tui(
             query_prefix: query_prefix.map(Arc::from),
             passage_prefix: passage_prefix.map(Arc::from),
             model_dtype: model_dtype.map(Arc::from),
-            local_hardware: Some(zrag_hw::probe()),
+            local_hardware: Some(zrag_hw::probe_effective()),
             ..App::default()
         };
 
@@ -136,6 +136,28 @@ async fn dispatch(app: &mut App, msg: AppMessage, tx: &mpsc::Sender<AppMessage>)
                 entries: shared,
                 selected: 0,
             });
+        }
+        AppMessage::VariantsDetected { index, variants } => {
+            // Update the live model list: derive formats from the cache-first
+            // variant detection and store the precision-level variants.
+            if let Screen::Setup(SetupPhase::ModelSelection { entries, .. }) =
+                &mut app.screen
+            {
+                let mut vec: Vec<registry::ModelEntry> = entries.to_vec();
+                if let Some(entry) = vec.get_mut(index) {
+                    let mut seen = Vec::new();
+                    for v in &variants {
+                        if !seen.contains(&v.format) {
+                            seen.push(v.format);
+                        }
+                    }
+                    entry.formats = seen;
+                    entry.variants = variants;
+                }
+                let new_entries: Arc<[registry::ModelEntry]> = Arc::from(vec);
+                app.setup_registry = Some(Arc::clone(&new_entries));
+                *entries = new_entries;
+            }
         }
         AppMessage::RegistryError(msg) => {
             app.screen = Screen::Setup(SetupPhase::Error {

@@ -38,7 +38,9 @@ pub enum SetupPhase {
     },
     DTypeSelection {
         model_id: Arc<str>,
+        choices: Arc<[zrag_embed::precision::DTypeChoice]>,
         selected: usize,
+        hw_label: &'static str,
     },
     IndexMethodSelection {
         model_id: Arc<str>,
@@ -163,6 +165,10 @@ pub enum AppMessage {
         remote_dim_hint: Option<usize>,
     },
     RegistryLoaded(Vec<ModelEntry>),
+    VariantsDetected {
+        index: usize,
+        variants: Vec<zrag_embed::model_registry::WeightVariant>,
+    },
     RegistryError(String),
     ModelDownloaded(Arc<str>),
     ModelDownloadError(String),

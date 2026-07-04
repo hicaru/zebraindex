@@ -184,31 +184,70 @@ pub async fn resolve_startup(tx: mpsc::Sender<app::AppMessage>) {
 }
 
 pub async fn fetch_registry(tx: mpsc::Sender<app::AppMessage>) {
-    if let Ok(Some(mut reg)) = registry::load() {
-        reg.entries.splice(0..0, registry::remote_sentinels());
-        let _ = tx.send(app::AppMessage::RegistryLoaded(reg.entries)).await;
-        return;
-    }
-
-    let result: anyhow::Result<Vec<registry::ModelEntry>> = async {
-        let resp = reqwest::get(REGISTRY_URL).await?;
-        let body = resp.text().await?;
-        let path = registry::registry_path()?;
-        tokio::fs::write(&path, body.as_bytes()).await?;
-        let mut reg = registry::parse(&body)?;
-        reg.entries.splice(0..0, registry::remote_sentinels());
-        Ok(reg.entries)
-    }
-    .await;
-
-    match result {
-        Ok(entries) => {
-            let _ = tx.send(app::AppMessage::RegistryLoaded(entries)).await;
+    let entries = match registry::load() {
+        Ok(Some(mut reg)) => {
+            reg.entries.splice(0..0, registry::remote_sentinels());
+            reg.entries
         }
-        Err(e) => {
-            let _ = tx.send(app::AppMessage::RegistryError(e.to_string())).await;
+        Ok(None) | Err(_) => match async {
+            let resp = reqwest::get(REGISTRY_URL).await?;
+            let body = resp.text().await?;
+            let path = registry::registry_path()?;
+            tokio::fs::write(&path, body.as_bytes()).await?;
+            let mut reg = registry::parse(&body)?;
+            reg.entries.splice(0..0, registry::remote_sentinels());
+            Ok::<_, anyhow::Error>(reg.entries)
         }
+        .await
+        {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = tx.send(app::AppMessage::RegistryError(e.to_string())).await;
+                return;
+            }
+        },
+    };
+
+    // Badge each model with the weight formats its HF repo actually ships
+    // (safetensors / gguf) so the picker shows which models support GGUF.
+    // List appears instantly; precision-level variants stream in per model
+    // as cache-first detection completes (no 8s wall).
+    let ids: Vec<(usize, String)> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !matches!(e.source, registry::ModelSource::Remote(_)))
+        .map(|(i, e)| (i, e.model_id.clone()))
+        .collect();
+    let _ = tx.send(app::AppMessage::RegistryLoaded(entries)).await;
+    detect_variants(&ids, &tx).await;
+}
+
+/// Stream `VariantsDetected` per model as cache-first variant detection
+/// completes. Bounded by an 8s deadline; remaining tasks are aborted so
+/// they don't keep running against dropped state.
+async fn detect_variants(ids: &[(usize, String)], tx: &mpsc::Sender<app::AppMessage>) {
+    use tokio::task::JoinSet;
+    let mut set: JoinSet<(
+        usize,
+        Vec<zrag_embed::model_registry::WeightVariant>,
+    )> = JoinSet::new();
+    for &(idx, ref id) in ids {
+        let id = id.clone();
+        set.spawn_blocking(move || {
+            (idx, zrag_embed::model_registry::detect_weight_variants(&id))
+        });
     }
+    let collect = async {
+        while let Some(res) = set.join_next().await {
+            if let Ok((idx, variants)) = res {
+                let _ = tx
+                    .send(app::AppMessage::VariantsDetected { index: idx, variants })
+                    .await;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(8), collect).await;
+    set.abort_all();
 }
 
 pub fn spawn_fetch_remote_models(
