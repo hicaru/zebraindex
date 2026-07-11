@@ -432,14 +432,12 @@ impl EmbedEngine {
         });
 
         // Select the GGUF quant variant file when a quant is requested.
-        if let Some(RequestedPrecision::Quant(ref v)) = requested {
-            if profile.format == WeightsFormat::Gguf {
-                if let Some(dir) = profile.weights_path.parent() {
-                    if let Ok(path) = crate::model_registry::find_gguf_in(dir, Some(v)) {
-                        profile.weights_path = path;
-                    }
-                }
-            }
+        if let Some(RequestedPrecision::Quant(ref v)) = requested
+            && profile.format == WeightsFormat::Gguf
+            && let Some(dir) = profile.weights_path.parent()
+            && let Ok(path) = crate::model_registry::find_gguf_in(dir, Some(v))
+        {
+            profile.weights_path = path;
         }
 
         // Quant-first unless the user explicitly chose a dense dtype.

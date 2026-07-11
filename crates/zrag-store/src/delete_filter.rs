@@ -42,3 +42,26 @@ fn push_escaped_sql_string(value: &str, out: &mut String) {
         out.push(ch);
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::file_path_delete_filters;
+
+    #[test]
+    fn filters_use_exact_path_strings() {
+        // Chunks store absolute paths; files store relative. A relative delete
+        // filter must not be assumed to match absolute chunk rows.
+        let rel = file_path_delete_filters(&["src/foo.rs"]);
+        assert_eq!(rel, vec!["file_path IN ('src/foo.rs')"]);
+
+        let abs = file_path_delete_filters(&["/tmp/proj/src/foo.rs"]);
+        assert_eq!(abs, vec!["file_path IN ('/tmp/proj/src/foo.rs')"]);
+        assert_ne!(rel, abs);
+    }
+
+    #[test]
+    fn filters_escape_single_quotes() {
+        let f = file_path_delete_filters(&["it's.rs"]);
+        assert_eq!(f, vec!["file_path IN ('it''s.rs')"]);
+    }
+}

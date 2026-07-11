@@ -89,11 +89,13 @@ where
     let terminal = match final_result {
         Ok(stats) => {
             *project.search_params.write().await = None;
-            if let Some(manager) = state.watch.get()
-                && let Ok(root) = std::path::Path::new(&req.project_root).canonicalize()
-            {
+            *project.dsl_index.write().await = None;
+            if let Ok(root) = std::path::Path::new(&req.project_root).canonicalize() {
                 let pid = zrag_common::ids::project_id(&root);
-                let _ = manager.watch(root, pid).await;
+                state.ann.invalidate(&pid).await;
+                if let Some(manager) = state.watch.get() {
+                    let _ = manager.watch(root, pid).await;
+                }
             }
             Response::Index(Ok(IndexStats {
                 total_chunks: stats.total_chunks,

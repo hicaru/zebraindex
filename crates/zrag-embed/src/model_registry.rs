@@ -674,10 +674,6 @@ pub fn is_model_cached(model_id: &str) -> bool {
     })
 }
 
-/// True if the HF cache holds any `*.{ext}` for `model_id`, per the standard cache
-/// layout `models--{org}--{name}/snapshots/{rev}/*`.
-
-
 // ── Weight-variant detection (precision-level) ───────────────────────────
 
 /// Detect weight variants (precision-level) for `model_id`: cache-first
@@ -694,32 +690,31 @@ pub fn detect_weight_variants(model_id: &str) -> Vec<WeightVariant> {
     collect_cached_variants(&cache_dir, model_id, &mut out);
 
     // 2. Network only when the cache told us nothing.
-    if out.is_empty() {
-        if let Some(siblings) = hf_repo_siblings(&cache_dir, model_id) {
-            let st_precision = safetensors_precision(&cache_dir, model_id);
-            for name in &siblings {
-                if name.ends_with(".safetensors") {
-                    push_unique(
-                        &mut out,
-                        WeightVariant {
-                            format: WeightsFormat::Safetensors,
-                            precision: st_precision.clone(),
-                            file: None,
-                            size_bytes: None,
-                        },
-                    );
-                } else if name.ends_with(".gguf") {
-                    push_unique(
-                        &mut out,
-                        WeightVariant {
-                            format: WeightsFormat::Gguf,
-                            precision: quant_from_filename(name)
-                                .unwrap_or_else(|| "gguf".into()),
-                            file: Some(name.clone()),
-                            size_bytes: None,
-                        },
-                    );
-                }
+    if out.is_empty()
+        && let Some(siblings) = hf_repo_siblings(&cache_dir, model_id)
+    {
+        let st_precision = safetensors_precision(&cache_dir, model_id);
+        for name in &siblings {
+            if name.ends_with(".safetensors") {
+                push_unique(
+                    &mut out,
+                    WeightVariant {
+                        format: WeightsFormat::Safetensors,
+                        precision: st_precision.clone(),
+                        file: None,
+                        size_bytes: None,
+                    },
+                );
+            } else if name.ends_with(".gguf") {
+                push_unique(
+                    &mut out,
+                    WeightVariant {
+                        format: WeightsFormat::Gguf,
+                        precision: quant_from_filename(name).unwrap_or_else(|| "gguf".into()),
+                        file: Some(name.clone()),
+                        size_bytes: None,
+                    },
+                );
             }
         }
     }
@@ -855,14 +850,12 @@ fn cached_safetensors_precision(snapshots: &Path) -> String {
     };
     for rev in revs.flatten() {
         let cfg = rev.path().join("config.json");
-        if let Ok(text) = std::fs::read_to_string(&cfg) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(dt) = v.get("torch_dtype").and_then(|d| d.as_str()) {
-                    if let Some(hint) = ComputeDTypeHint::from_torch_dtype(dt) {
-                        return hint.precision_id().into();
-                    }
-                }
-            }
+        if let Ok(text) = std::fs::read_to_string(&cfg)
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+            && let Some(dt) = v.get("torch_dtype").and_then(|d| d.as_str())
+            && let Some(hint) = ComputeDTypeHint::from_torch_dtype(dt)
+        {
+            return hint.precision_id().into();
         }
     }
     "f32".into()

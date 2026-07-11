@@ -137,10 +137,10 @@ fn mark_recommended(out: &mut [DTypeChoice], gpu: bool, fast: bool) {
     } else {
         out.iter().position(|c| c.cli_value == "f32")
     };
-    if let Some(i) = target {
-        if let Some(c) = out.get_mut(i) {
-            c.recommended = true;
-        }
+    if let Some(i) = target
+        && let Some(c) = out.get_mut(i)
+    {
+        c.recommended = true;
     }
 }
 

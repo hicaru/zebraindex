@@ -128,6 +128,16 @@ pub struct IndexStats {
     pub paused: bool,
 }
 
+/// Absolute path as stored in the chunks table for a project-relative file.
+///
+/// The files table keys rows by relative path (`src/foo.rs`); chunks store the
+/// absolute path (`/abs/root/src/foo.rs`) via the same `root.join(rel).display()`
+/// construction used at insert time. Deletes must use this form or no rows match.
+#[inline]
+fn chunk_file_path(root: &Path, rel: &str) -> String {
+    root.join(rel).display().to_string()
+}
+
 pub async fn index_project(
     root: &Path,
     engine: &AnyEmbedEngine,
@@ -185,11 +195,12 @@ pub async fn index_project(
     }
 
     let need_reindex: Vec<String>;
-    let to_delete: Vec<&str>;
+    // Relative paths for the files table (and change detection keys).
+    let rel_delete: Vec<&str>;
 
     if force_rebuild {
         need_reindex = snapshots.keys().cloned().collect();
-        to_delete = previous.iter().map(|r| r.file_path.as_str()).collect();
+        rel_delete = previous.iter().map(|r| r.file_path.as_str()).collect();
     } else {
         need_reindex = changes
             .added
@@ -199,7 +210,7 @@ pub async fn index_project(
             .collect();
         // Delete prior chunks for EVERY file we're about to reindex (added too),
         // so a resumed run can't duplicate chunks left behind by a paused run.
-        to_delete = changes
+        rel_delete = changes
             .removed
             .iter()
             .map(String::as_str)
@@ -207,19 +218,95 @@ pub async fn index_project(
             .collect();
     }
 
-    if !to_delete.is_empty() {
-        chunks_table.delete_for_files(&to_delete).await?;
-        files_table.delete_for_paths(&to_delete).await?;
-        info!("deleted chunks for {} files", to_delete.len());
+    if !rel_delete.is_empty() {
+        // chunks.file_path is absolute; files.file_path is relative.
+        let abs_delete: Vec<String> = rel_delete
+            .iter()
+            .map(|rel| chunk_file_path(root, rel))
+            .collect();
+        let abs_delete_refs: Vec<&str> = abs_delete.iter().map(String::as_str).collect();
+        chunks_table.delete_for_files(&abs_delete_refs).await?;
+        files_table.delete_for_paths(&rel_delete).await?;
+        info!(
+            files = rel_delete.len(),
+            "deleted file rows + chunks for paths"
+        );
     }
 
     if need_reindex.is_empty() {
-        reporter.finish_with_message("nothing to reindex");
+        // True no-op: nothing removed and nothing to embed.
+        if rel_delete.is_empty() {
+            reporter.finish_with_message("nothing to reindex");
+            let elapsed = start.elapsed();
+            return Ok(IndexStats {
+                total_chunks: chunks_table.len().await.unwrap_or(0),
+                total_files: snapshots.len(),
+                new_chunks: 0,
+                reindexed_files: 0,
+                duration_ms: elapsed.as_millis() as u64,
+                paused: false,
+            });
+        }
+
+        // Removals only — chunks already deleted above; refresh project metadata
+        // so total_chunks / total_files stay honest for search overfetch.
+        let total_in_db = chunks_table.len().await?;
+        if total_in_db > 0 {
+            let _ = chunks_table.optimize().await;
+        }
+
+        let fallback_hw;
+        let hw = if let Some(hw) = engine.hardware() {
+            hw
+        } else {
+            fallback_hw = zrag_hw::probe_effective();
+            &fallback_hw
+        };
+        let previous_params: Option<zrag_ann::SearchParams> = project_row
+            .as_ref()
+            .and_then(|r| r.search_params.as_deref())
+            .and_then(|s| toml::from_str(s).ok());
+        let mut params =
+            zrag_ann::choose_method(total_in_db, engine.dim(), hw, previous_params.as_ref());
+        if let Some(m) = override_method {
+            params.method = m;
+        }
+
+        let languages: HashSet<Language> = snapshots
+            .values()
+            .filter_map(|s| match s.kind {
+                SourceKind::Code(l) => Some(l),
+                SourceKind::Tsv | SourceKind::Psv | SourceKind::Text | SourceKind::Pdf => None,
+            })
+            .collect();
+        let languages: Vec<&Language> = languages.iter().collect();
+        upsert_project(
+            db,
+            &pid,
+            root_str,
+            total_in_db,
+            snapshots.len(),
+            &languages,
+            engine,
+            &params,
+        )
+        .await?;
+
+        info!(
+            removed = changes.removed.len(),
+            remaining_files = snapshots.len(),
+            remaining_chunks = total_in_db,
+            "index: removals applied, no files to re-embed"
+        );
+        reporter.finish_with_message(&format!(
+            "removed {} file(s), {} passages remain",
+            changes.removed.len(),
+            total_in_db
+        ));
         let elapsed = start.elapsed();
-        let total_files = snapshots.len();
         return Ok(IndexStats {
-            total_chunks: 0,
-            total_files,
+            total_chunks: total_in_db,
+            total_files: snapshots.len(),
             new_chunks: 0,
             reindexed_files: 0,
             duration_ms: elapsed.as_millis() as u64,
@@ -1094,10 +1181,18 @@ async fn upsert_project(
 
 #[cfg(test)]
 mod tests_indexing {
-    use super::{MIN_CHUNK_FLOOR, content_chunk_id, sizing_for};
+    use super::{MIN_CHUNK_FLOOR, chunk_file_path, content_chunk_id, sizing_for};
     use std::borrow::Cow;
+    use std::path::Path;
     use zrag_dsl::chunking::{Chunk, ChunkStrategy};
     use zrag_ts_core::types::Kind;
+
+    #[test]
+    fn chunk_delete_paths_are_absolute_under_root() {
+        let root = Path::new("/tmp/proj");
+        assert_eq!(chunk_file_path(root, "src/a.rs"), "/tmp/proj/src/a.rs");
+        assert_eq!(chunk_file_path(root, "lib/b.ts"), "/tmp/proj/lib/b.ts");
+    }
 
     #[test]
     fn sizing_for_none_when_body_fits() {
